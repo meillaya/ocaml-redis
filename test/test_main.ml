@@ -1208,6 +1208,49 @@ let test_pubsub_publish_and_unsubscribe () =
               (send_command publisher [ "PUBLISH"; "updates"; "payload-2" ])
             ~context:"publish after unsubscribe reaches nobody"))
 
+let test_pubsub_unsubscribe_all_and_ping_edges () =
+  with_server (fun ~port:_ ~connect ->
+      let subscriber = connect () in
+      Fun.protect
+        ~finally:(fun () -> Unix.close subscriber)
+        (fun () ->
+          assert_string_equal
+            ~expected:"*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n"
+            ~actual:(send_command subscriber [ "UNSUBSCRIBE" ])
+            ~context:"unsubscribe without subscriptions returns nil channel";
+          let subscribe_payload =
+            Redis.Resp.encode_command [ "SUBSCRIBE"; "first"; "second" ]
+          in
+          ignore
+            (Unix.write_substring subscriber subscribe_payload 0
+               (String.length subscribe_payload));
+          ignore (read_until_quiet subscriber);
+          assert_string_equal ~expected:"*2\r\n$4\r\npong\r\n$0\r\n\r\n"
+            ~actual:(send_command subscriber [ "PING" ])
+            ~context:"bare ping in subscribed mode uses empty payload";
+          let payload = Redis.Resp.encode_command [ "UNSUBSCRIBE" ] in
+          ignore
+            (Unix.write_substring subscriber payload 0 (String.length payload));
+          assert_string_equal
+            ~expected:
+              "*3\r\n\
+               $11\r\n\
+               unsubscribe\r\n\
+               $6\r\n\
+               second\r\n\
+               :1\r\n\
+               *3\r\n\
+               $11\r\n\
+               unsubscribe\r\n\
+               $5\r\n\
+               first\r\n\
+               :0\r\n"
+            ~actual:(read_until_quiet subscriber)
+            ~context:"unsubscribe all unwinds subscriptions in reverse order";
+          assert_string_equal ~expected:"+PONG\r\n"
+            ~actual:(send_command subscriber [ "PING" ])
+            ~context:"after final unsubscribe client leaves subscribed mode"))
+
 let test_server_geo_commands () =
   with_server (fun ~port:_ ~connect ->
       let client = connect () in
@@ -1857,6 +1900,8 @@ let tests =
       test_pubsub_subscribe_multiple_channels );
     ( "pubsub publish delivers and unsubscribe removes subscriber",
       test_pubsub_publish_and_unsubscribe );
+    ( "pubsub unsubscribe-all and subscribed ping edges are compatible",
+      test_pubsub_unsubscribe_all_and_ping_edges );
     ("server supports geospatial commands", test_server_geo_commands);
     ( "server enforces geospatial validation and wrong-type boundaries",
       test_server_geo_wrong_type_and_validation );

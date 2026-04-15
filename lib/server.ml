@@ -21,6 +21,7 @@ type client = {
   mutable authenticated : bool;
   watched : (string, int64) Hashtbl.t;
   subscriptions : (string, unit) Hashtbl.t;
+  mutable subscription_order_rev : string list;
   mutable replica_peer : bool;
   mutable replica_ack_offset : int64;
   mutable last_write_offset : int64;
@@ -258,15 +259,20 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
   let list_waiters : (string, client Queue.t) Hashtbl.t = Hashtbl.create 16 in
   let stream_waiters : (string, client Queue.t) Hashtbl.t = Hashtbl.create 16 in
   let add_channel_subscription channel client =
-    let subscribers =
-      Hashtbl.find_opt channel_subscribers channel |> Option.value ~default:[]
-    in
     if not (Hashtbl.mem client.subscriptions channel) then (
+      let subscribers =
+        Hashtbl.find_opt channel_subscribers channel |> Option.value ~default:[]
+      in
       Hashtbl.replace client.subscriptions channel ();
+      client.subscription_order_rev <- channel :: client.subscription_order_rev;
       Hashtbl.replace channel_subscribers channel (client :: subscribers))
   in
   let remove_channel_subscription channel client =
     Hashtbl.remove client.subscriptions channel;
+    client.subscription_order_rev <-
+      List.filter
+        (fun subscribed -> subscribed <> channel)
+        client.subscription_order_rev;
     match Hashtbl.find_opt channel_subscribers channel with
     | None -> ()
     | Some subscribers ->
@@ -305,9 +311,7 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
            Resp.Bulk_string (Some (Option.value ~default:"" message));
          ])
   in
-  let subscribed_channels client =
-    Hashtbl.to_seq_keys client.subscriptions |> List.of_seq
-  in
+  let subscribed_channels client = client.subscription_order_rev in
   let channels_to_unsubscribe client channels =
     if channels = [] then subscribed_channels client else channels
   in
@@ -795,6 +799,7 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
         authenticated = Option.is_none requirepass;
         watched = Hashtbl.create 8;
         subscriptions = Hashtbl.create 8;
+        subscription_order_rev = [];
         replica_peer = false;
         replica_ack_offset = 0L;
         last_write_offset = 0L;
