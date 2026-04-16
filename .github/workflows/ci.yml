@@ -12,20 +12,35 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up OCaml
-        uses: ocaml/setup-ocaml@v3
-        with:
-          ocaml-compiler: 5.2.1
-          cache-prefix: v1
+      - name: Install opam and system prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y opam bubblewrap m4 pkg-config
+
+      - name: Initialize opam
+        run: |
+          opam init --disable-sandboxing --yes --bare
+
+      - name: Create local compiler switch
+        run: |
+          opam switch create . ocaml-base-compiler.5.2.1 --yes
 
       - name: Install build tooling
-        run: opam install dune ocamlformat --yes
+        run: |
+          eval "$(opam env --switch=. --set-switch)"
+          opam install dune ocamlformat --yes
 
       - name: Build
-        run: dune build
+        run: |
+          eval "$(opam env --switch=. --set-switch)"
+          dune build
 
       - name: Run deterministic test suite
-        run: dune test --display=short
+        run: |
+          eval "$(opam env --switch=. --set-switch)"
+          dune test --display=short
 
       - name: Run direct test executable
-        run: dune exec test/test_main.exe
+        run: |
+          eval "$(opam env --switch=. --set-switch)"
+          dune exec test/test_main.exe
