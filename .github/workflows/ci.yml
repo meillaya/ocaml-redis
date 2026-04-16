@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.2.1
+          cache-prefix: v1
+
+      - name: Install build tooling
+        run: opam install dune ocamlformat --yes
+
+      - name: Build
+        run: dune build
+
+      - name: Run deterministic test suite
+        run: dune test --display=short
+
+      - name: Run direct test executable
+        run: dune exec test/test_main.exe
