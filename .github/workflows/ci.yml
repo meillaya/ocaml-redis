@@ -8,6 +8,11 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ocaml-compiler: ['5.1.1', '5.2.1']
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -17,13 +22,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y opam bubblewrap m4 pkg-config
 
+      - name: Cache opam downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.opam/download-cache
+          key: ${{ runner.os }}-opam-download-cache-${{ matrix.ocaml-compiler }}-${{ hashFiles('dune-project', '.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-opam-download-cache-${{ matrix.ocaml-compiler }}-
+            ${{ runner.os }}-opam-download-cache-
+
       - name: Initialize opam
         run: |
           opam init --disable-sandboxing --yes --bare
 
       - name: Create local compiler switch
         run: |
-          opam switch create . ocaml-base-compiler.5.2.1 --yes
+          opam switch create . ocaml-base-compiler.${{ matrix.ocaml-compiler }} --yes
 
       - name: Install build tooling
         run: |

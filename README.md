@@ -1,6 +1,6 @@
 # ocaml-redis
 
-[![CI](https://github.com/Meillaya/ocaml-redis/actions/workflows/ci.yml/badge.svg)](https://github.com/Meillaya/ocaml-redis/actions/workflows/ci.yml)
+[![CI](https://github.com/Meillaya/ocaml-redis/actions/workflows/ci.yml/badge.svg)](https://github.com/Meillaya/ocaml-redis/actions/workflows/ci.yml) [![Release](https://github.com/Meillaya/ocaml-redis/actions/workflows/release.yml/badge.svg)](https://github.com/Meillaya/ocaml-redis/actions/workflows/release.yml)
 
 A correctness-first Redis learning implementation in OCaml.
 
