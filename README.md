@@ -539,7 +539,7 @@ Run the full regression suite:
 dune test --display=short
 ```
 
-The test suite covers:
+The automated test suite covers:
 
 - deterministic expiry behavior
 - parser and protocol edges
@@ -551,6 +551,108 @@ The test suite covers:
 - Pub/Sub edge shapes
 - auth gating and ACL subset behavior
 - wrong-type and missing-key shape distinctions
+
+### Manual replication smoke test
+
+If you have a live Redis-compatible server already running on port `6379`, you can test replica startup and propagation manually.
+
+First confirm the upstream server is reachable:
+
+```sh
+redis-cli -p 6379 PING
+```
+
+Or, if you are using Valkey tools:
+
+```sh
+valkey-cli -p 6379 PING
+```
+
+Expected output:
+
+```text
+PONG
+```
+
+Start `ocaml-redis` as a replica on a different port:
+
+```sh
+dune exec app/server_main.exe -- --port 6381 --replicaof 127.0.0.1:6379
+```
+
+In a second terminal, inspect the replica's replication state:
+
+```sh
+redis-cli -p 6381 INFO replication
+```
+
+Expected fields include:
+
+```text
+role:slave
+master_host:127.0.0.1
+master_port:6379
+master_link_status:up
+```
+
+Write values to the upstream server:
+
+```sh
+redis-cli -p 6379 SET hello world
+redis-cli -p 6379 SET counter 1
+```
+
+Read them from the replica:
+
+```sh
+redis-cli -p 6381 GET hello
+redis-cli -p 6381 GET counter
+```
+
+Expected output:
+
+```text
+world
+1
+```
+
+Test continuing propagation:
+
+```sh
+redis-cli -p 6379 INCR counter
+redis-cli -p 6381 GET counter
+```
+
+Expected output:
+
+```text
+2
+```
+
+Test read-only enforcement on the replica:
+
+```sh
+redis-cli -p 6381 SET nope value
+```
+
+Expected output:
+
+```text
+READONLY You can't write against a read only replica.
+```
+
+Test `WAIT` from the upstream server:
+
+```sh
+redis-cli -p 6379 SET sync-key value
+redis-cli -p 6379 WAIT 1 1000
+```
+
+Expected output:
+
+```text
+1
+```
 
 ## Formatting
 
