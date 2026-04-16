@@ -26,7 +26,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.opam/download-cache
-          key: ${{ runner.os }}-opam-download-cache-${{ matrix.ocaml-compiler }}-${{ hashFiles('dune-project', '.github/workflows/ci.yml') }}
+          key: ${{ runner.os }}-opam-download-cache-${{ matrix.ocaml-compiler }}-${{ hashFiles('dune-project', '.github/workflows/ci.yml', 'app/dune', 'lib/dune', 'test/dune') }}
           restore-keys: |
             ${{ runner.os }}-opam-download-cache-${{ matrix.ocaml-compiler }}-
             ${{ runner.os }}-opam-download-cache-
@@ -36,7 +36,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: _opam
-          key: ${{ runner.os }}-local-switch-${{ matrix.ocaml-compiler }}-${{ hashFiles('dune-project', '.github/workflows/ci.yml') }}
+          key: ${{ runner.os }}-local-switch-${{ matrix.ocaml-compiler }}-${{ hashFiles('dune-project', '.github/workflows/ci.yml', 'app/dune', 'lib/dune', 'test/dune') }}
 
       - name: Initialize opam
         run: |
@@ -50,7 +50,6 @@ jobs:
             echo "Creating local switch for OCaml ${{ matrix.ocaml-compiler }} (first run may take several minutes while the compiler builds)"
             opam switch create . ocaml-base-compiler.${{ matrix.ocaml-compiler }} --yes --verbose
           fi
-          opam switch .
 
       - name: Install build tooling
         run: |

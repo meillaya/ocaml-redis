@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish or refresh as a release (for example v0.1.1)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -20,7 +26,11 @@ jobs:
       - name: Generate release notes from tag annotation / commit context
         id: notes
         run: |
-          tag_name="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            tag_name="${{ inputs.tag }}"
+          else
+            tag_name="${GITHUB_REF_NAME}"
+          fi
           if [ -f CHANGELOG.md ]; then
             notes=$(awk -v tag="$tag_name" '
               BEGIN {
@@ -53,5 +63,6 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           body: ${{ steps.notes.outputs.body }}
           generate_release_notes: false

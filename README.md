@@ -553,6 +553,8 @@ dune exec test/test_main.exe
 
 The direct executable form now works from the repository root as well as through Dune's normal test flow.
 
+The GitHub Actions CI workflow runs the same deterministic lane across a small OCaml version matrix. The first uncached run on a fresh hosted runner can take several minutes because opam may need to build the OCaml compiler switch from source; later runs should be faster when the workflow caches hit.
+
 The automated test suite covers:
 
 - deterministic expiry behavior
