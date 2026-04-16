@@ -1,6 +1,8 @@
 let fail message = raise (Failure message)
 let next_test_port = ref 41000
 
+type live_config = { host : string; port : int }
+
 let discover_server_executable () =
   let from_test_executable () =
     let test_executable = Unix.realpath Sys.executable_name in
@@ -24,6 +26,29 @@ let discover_server_executable () =
 
 let server_executable = discover_server_executable ()
 
+let env_truthy name =
+  match Sys.getenv_opt name with
+  | Some ("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") -> true
+  | _ -> false
+
+let live_config_opt () =
+  if not (env_truthy "OCAML_REDIS_LIVE") then None
+  else
+    let host =
+      Sys.getenv_opt "OCAML_REDIS_LIVE_HOST"
+      |> Option.value ~default:"127.0.0.1"
+    in
+    let port =
+      match Sys.getenv_opt "OCAML_REDIS_LIVE_PORT" with
+      | None -> 6379
+      | Some value -> (
+          match int_of_string_opt value with
+          | Some port -> port
+          | None ->
+              fail ("OCAML_REDIS_LIVE_PORT must be an integer, got " ^ value))
+    in
+    Some { host; port }
+
 let assert_int64_equal ~expected ~actual ~context =
   if expected <> actual then
     fail (Printf.sprintf "%s: expected %Ld but got %Ld" context expected actual)
@@ -31,6 +56,11 @@ let assert_int64_equal ~expected ~actual ~context =
 let assert_string_equal ~expected ~actual ~context =
   if expected <> actual then
     fail (Printf.sprintf "%s: expected %S but got %S" context expected actual)
+
+let assert_string_starts_with ~prefix ~actual ~context =
+  if not (String.starts_with ~prefix actual) then
+    fail
+      (Printf.sprintf "%s: expected prefix %S but got %S" context prefix actual)
 
 let wrongtype_reply =
   "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
@@ -57,6 +87,12 @@ let assert_contains ~needle ~haystack ~context =
       (Printf.sprintf "%s: expected to find %S in %S" context needle haystack)
 
 let assert_bool value ~context = if not value then fail context
+
+let assert_live_match ~context ~live_reply ~repo_reply =
+  if live_reply <> repo_reply then
+    fail
+      (Printf.sprintf "%s: live reply %S but repo reply %S" context live_reply
+         repo_reply)
 
 let assert_wrongtype ~actual ~context =
   assert_string_equal ~expected:wrongtype_reply ~actual ~context
@@ -139,6 +175,43 @@ let with_server ?replicaof ?rdb_file ?requirepass test_fn =
       ignore (Unix.waitpid [] pid))
     (fun () -> test_fn ~port ~connect:(fun () -> connect_with_retry port))
 
+let resolve_host host =
+  try Unix.inet_addr_of_string host
+  with Failure _ -> (Unix.gethostbyname host).Unix.h_addr_list.(0)
+
+let connect_to_host_port ?(timeout_seconds = 2.0) ~host ~port () =
+  let inet_addr = resolve_host host in
+  let fd = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Unix.set_nonblock fd;
+  match Unix.connect fd (Unix.ADDR_INET (inet_addr, port)) with
+  | () ->
+      Unix.clear_nonblock fd;
+      fd
+  | exception Unix.Unix_error (Unix.EINPROGRESS, _, _) ->
+      let _, writable, _ = Unix.select [] [ fd ] [] timeout_seconds in
+      if writable = [] then (
+        Unix.close fd;
+        fail
+          (Printf.sprintf "timed out connecting to live server %s:%d" host port))
+      else (
+        Unix.clear_nonblock fd;
+        match Unix.getsockopt_error fd with
+        | None -> fd
+        | Some error ->
+            Unix.close fd;
+            fail
+              (Printf.sprintf "failed connecting to live server %s:%d (%s)" host
+                 port (Unix.error_message error)))
+  | exception Unix.Unix_error (error, _, _) ->
+      Unix.close fd;
+      fail
+        (Printf.sprintf "failed connecting to live server %s:%d (%s)" host port
+           (Unix.error_message error))
+
+let with_live_connection config test_fn =
+  let fd = connect_to_host_port ~host:config.host ~port:config.port () in
+  Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> test_fn fd)
+
 let read_reply fd =
   let buffer = Bytes.create 8192 in
   let bytes_read = Unix.read fd buffer 0 (Bytes.length buffer) in
@@ -171,6 +244,31 @@ let send_command fd arguments =
   loop 0;
   read_reply fd
 
+let send_only fd arguments =
+  let payload = Redis.Resp.encode_command arguments in
+  let rec loop offset =
+    if offset < String.length payload then
+      let written =
+        Unix.write_substring fd payload offset (String.length payload - offset)
+      in
+      loop (offset + written)
+  in
+  loop 0
+
+let parse_integer_reply reply =
+  if String.length reply < 4 || reply.[0] <> ':' then
+    fail ("expected integer reply, got " ^ reply);
+  match
+    Int64.of_string_opt
+      (String.sub reply 1 (String.length reply - String.length ":\r\n"))
+  with
+  | Some value -> value
+  | None -> fail ("could not parse integer reply: " ^ reply)
+
+let unique_prefix label =
+  let micros = Int64.of_float (Unix.gettimeofday () *. 1_000_000.) in
+  Printf.sprintf "ocamlredis:%d:%Ld:%s" (Unix.getpid ()) micros label
+
 let parse_bulk_float_reply reply =
   match String.split_on_char '\r' reply with
   | _len :: value :: _ -> (
@@ -192,6 +290,174 @@ let retry_until timeout_seconds f =
           loop ())
   in
   loop ()
+
+let test_live_pubsub_raw_shapes config () =
+  let prefix = unique_prefix "live-pubsub" in
+  let channel_a = prefix ^ ":a" in
+  let channel_b = prefix ^ ":b" in
+  with_server (fun ~port:_ ~connect ->
+      with_live_connection config (fun live ->
+          let repo = connect () in
+          Fun.protect
+            ~finally:(fun () -> Unix.close repo)
+            (fun () ->
+              assert_live_match
+                ~context:"live unsubscribe without subscriptions shape"
+                ~live_reply:(send_command live [ "UNSUBSCRIBE" ])
+                ~repo_reply:(send_command repo [ "UNSUBSCRIBE" ]);
+              send_only live [ "SUBSCRIBE"; channel_a; channel_b ];
+              send_only repo [ "SUBSCRIBE"; channel_a; channel_b ];
+              assert_live_match ~context:"live subscribe ack arrays"
+                ~live_reply:(read_until_quiet live)
+                ~repo_reply:(read_until_quiet repo);
+              assert_live_match ~context:"live subscribed bare ping shape"
+                ~live_reply:(send_command live [ "PING" ])
+                ~repo_reply:(send_command repo [ "PING" ]);
+              assert_live_match ~context:"live subscribed ping message shape"
+                ~live_reply:(send_command live [ "PING"; "hello" ])
+                ~repo_reply:(send_command repo [ "PING"; "hello" ]);
+              send_only live [ "UNSUBSCRIBE" ];
+              send_only repo [ "UNSUBSCRIBE" ];
+              assert_live_match
+                ~context:"live unsubscribe-all ordering and shape"
+                ~live_reply:(read_until_quiet live)
+                ~repo_reply:(read_until_quiet repo))))
+
+let test_live_transaction_and_geo_shapes config () =
+  let prefix = unique_prefix "live-shapes" in
+  let tx_key = prefix ^ ":tx" in
+  let zset_key = prefix ^ ":zset" in
+  let geo_key = prefix ^ ":geo" in
+  with_server (fun ~port:_ ~connect ->
+      with_live_connection config (fun live_a ->
+          with_live_connection config (fun live_b ->
+              let repo_a = connect () in
+              let repo_b = connect () in
+              Fun.protect
+                ~finally:(fun () ->
+                  Unix.close repo_a;
+                  Unix.close repo_b)
+                (fun () ->
+                  assert_live_match ~context:"exec outside multi live raw shape"
+                    ~live_reply:(send_command live_a [ "EXEC" ])
+                    ~repo_reply:(send_command repo_a [ "EXEC" ]);
+                  assert_live_match
+                    ~context:"discard outside multi live raw shape"
+                    ~live_reply:(send_command live_a [ "DISCARD" ])
+                    ~repo_reply:(send_command repo_a [ "DISCARD" ]);
+                  ignore (send_command live_a [ "WATCH"; tx_key ]);
+                  ignore (send_command repo_a [ "WATCH"; tx_key ]);
+                  ignore (send_command live_a [ "MULTI" ]);
+                  ignore (send_command repo_a [ "MULTI" ]);
+                  ignore (send_command live_a [ "SET"; tx_key; "watcher" ]);
+                  ignore (send_command repo_a [ "SET"; tx_key; "watcher" ]);
+                  ignore (send_command live_b [ "SET"; tx_key; "modifier" ]);
+                  ignore (send_command repo_b [ "SET"; tx_key; "modifier" ]);
+                  assert_live_match
+                    ~context:"watched exec abort shape against live server"
+                    ~live_reply:(send_command live_a [ "EXEC" ])
+                    ~repo_reply:(send_command repo_a [ "EXEC" ]);
+                  ignore
+                    (send_command live_a [ "ZADD"; zset_key; "1"; "alpha" ]);
+                  ignore
+                    (send_command repo_a [ "ZADD"; zset_key; "1"; "alpha" ]);
+                  assert_live_match
+                    ~context:"zscore missing member live raw shape"
+                    ~live_reply:
+                      (send_command live_a [ "ZSCORE"; zset_key; "missing" ])
+                    ~repo_reply:
+                      (send_command repo_a [ "ZSCORE"; zset_key; "missing" ]);
+                  assert_live_match ~context:"zscore missing key live raw shape"
+                    ~live_reply:
+                      (send_command live_a
+                         [ "ZSCORE"; prefix ^ ":missing"; "alpha" ])
+                    ~repo_reply:
+                      (send_command repo_a
+                         [ "ZSCORE"; prefix ^ ":missing"; "alpha" ]);
+                  ignore
+                    (send_command live_a
+                       [
+                         "GEOADD";
+                         geo_key;
+                         "0";
+                         "0";
+                         "origin";
+                         "0";
+                         "1";
+                         "north";
+                       ]);
+                  ignore
+                    (send_command repo_a
+                       [
+                         "GEOADD";
+                         geo_key;
+                         "0";
+                         "0";
+                         "origin";
+                         "0";
+                         "1";
+                         "north";
+                       ]);
+                  assert_live_match
+                    ~context:"geodist missing member live raw shape"
+                    ~live_reply:
+                      (send_command live_a
+                         [ "GEODIST"; geo_key; "origin"; "missing" ])
+                    ~repo_reply:
+                      (send_command repo_a
+                         [ "GEODIST"; geo_key; "origin"; "missing" ])))))
+
+let test_live_replication_semantics config () =
+  let prefix = unique_prefix "live-replication" in
+  let key = prefix ^ ":key" in
+  let value = prefix ^ ":value" in
+  with_server ~replicaof:(config.host, config.port)
+    (fun ~port:_ ~connect:connect_replica ->
+      with_live_connection config (fun live_master ->
+          let replica = connect_replica () in
+          Fun.protect
+            ~finally:(fun () -> Unix.close replica)
+            (fun () ->
+              ignore
+                (retry_until 5.0 (fun () ->
+                     let reply =
+                       send_command replica [ "INFO"; "replication" ]
+                     in
+                     if string_contains reply "master_link_status:up" then
+                       Some reply
+                     else None));
+              ignore (send_command live_master [ "SET"; key; value ]);
+              let wait_reply =
+                send_command live_master [ "WAIT"; "1"; "2000" ]
+              in
+              assert_bool
+                (Int64.compare (parse_integer_reply wait_reply) 1L >= 0)
+                ~context:"live wait should observe at least one replica ack";
+              ignore
+                (retry_until 5.0 (fun () ->
+                     let reply = send_command replica [ "GET"; key ] in
+                     if
+                       reply
+                       = Printf.sprintf "$%d\r\n%s\r\n" (String.length value)
+                           value
+                     then Some reply
+                     else None));
+              assert_string_equal
+                ~expected:
+                  "-READONLY You can't write against a read only replica.\r\n"
+                ~actual:(send_command replica [ "SET"; key; "nope" ])
+                ~context:
+                  "repo replica should remain read-only against live master")))
+
+let live_tests config =
+  [
+    ( "live pubsub raw reply shapes match the local server",
+      fun () -> test_live_pubsub_raw_shapes config );
+    ( "live transaction and zset/geo reply shapes match the local server",
+      fun () -> test_live_transaction_and_geo_shapes config );
+    ( "live replication interop remains correct in the narrow supported subset",
+      fun () -> test_live_replication_semantics config );
+  ]
 
 let with_spawned_server argv test_fn =
   let pid =
@@ -1953,9 +2219,21 @@ let tests =
     ("server returns command errors and protocol errors", test_server_errors);
   ]
 
-let () =
+let run_tests tests =
   List.iter
     (fun (name, test_fn) ->
       test_fn ();
       Printf.printf "PASS: %s\n%!" name)
     tests
+
+let () =
+  run_tests tests;
+  match live_config_opt () with
+  | None -> ()
+  | Some config ->
+      Printf.printf "LIVE: using %s:%d\n%!" config.host config.port;
+      let probe_fd =
+        connect_to_host_port ~host:config.host ~port:config.port ()
+      in
+      Unix.close probe_fd;
+      run_tests (live_tests config)

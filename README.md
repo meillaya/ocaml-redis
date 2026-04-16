@@ -564,6 +564,51 @@ The automated test suite covers:
 - auth gating and ACL subset behavior
 - wrong-type and missing-key shape distinctions
 
+### Opt-in live conformance lane
+
+The default test suite is the authoritative regression lane and does **not** require a running external daemon.
+
+There is also an **opt-in** live conformance lane that compares selected already-implemented behaviors against a real local Redis-compatible server. It is deliberately kept out of the default `dune test` path so normal development and CI remain deterministic.
+
+Run the deterministic suite plus the live conformance probes:
+
+```sh
+OCAML_REDIS_LIVE=1 dune exec test/test_main.exe
+```
+
+Override the live target host or port if needed:
+
+```sh
+OCAML_REDIS_LIVE=1 OCAML_REDIS_LIVE_HOST=127.0.0.1 OCAML_REDIS_LIVE_PORT=6379 dune exec test/test_main.exe
+```
+
+The live lane currently checks a curated subset only:
+
+- exact Pub/Sub wire shapes
+- selected transaction reply shapes
+- selected sorted-set / geo nil-vs-bulk-vs-array distinctions
+- narrow replication interoperability in the already-supported subset
+
+Important boundaries:
+
+- live checks are **off by default**
+- the live lane assumes an unauthenticated daemon unless you explicitly provide a different setup
+- tests use unique prefixes and self-seeded state so they do not depend on an empty DB
+- if live mode is enabled but the daemon is unreachable, the runner fails clearly and intentionally
+
+Example of the expected unreachable-daemon failure mode:
+
+```sh
+OCAML_REDIS_LIVE=1 OCAML_REDIS_LIVE_PORT=6399 dune exec test/test_main.exe
+```
+
+Expected tail output:
+
+```text
+LIVE: using 127.0.0.1:6399
+Fatal error: exception Failure("failed connecting to live server 127.0.0.1:6399 (Connection refused)")
+```
+
 ### Manual replication smoke test
 
 If you have a live Redis-compatible server already running on port `6379`, you can test replica startup and propagation manually.
