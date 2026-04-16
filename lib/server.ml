@@ -165,6 +165,59 @@ let read_frame_blocking fd buffer_ref =
   in
   loop ()
 
+let find_crlf input ~start =
+  let rec loop index =
+    if index + 1 >= String.length input then None
+    else if input.[index] = '\r' && input.[index + 1] = '\n' then Some index
+    else loop (index + 1)
+  in
+  loop start
+
+let read_rdb_payload_blocking fd buffer_ref =
+  let rec read_more () =
+    let chunk = Bytes.create 4096 in
+    match Unix.read fd chunk 0 (Bytes.length chunk) with
+    | 0 -> failwith "unexpected EOF while reading full-resync RDB payload"
+    | read -> buffer_ref := !buffer_ref ^ Bytes.sub_string chunk 0 read
+  in
+  let rec read_length_line () =
+    match find_crlf !buffer_ref ~start:0 with
+    | Some stop ->
+        let line = String.sub !buffer_ref 0 stop in
+        buffer_ref :=
+          String.sub !buffer_ref (stop + 2)
+            (String.length !buffer_ref - stop - 2);
+        line
+    | None ->
+        read_more ();
+        read_length_line ()
+  in
+  let length_line = read_length_line () in
+  if String.length length_line = 0 || length_line.[0] <> '$' then
+    failwith "expected RDB bulk length after FULLRESYNC";
+  let payload_length =
+    match
+      int_of_string_opt
+        (String.sub length_line 1 (String.length length_line - 1))
+    with
+    | Some length when length >= 0 -> length
+    | _ -> failwith "invalid RDB bulk length after FULLRESYNC"
+  in
+  let rec ensure_payload () =
+    if String.length !buffer_ref < payload_length then (
+      read_more ();
+      ensure_payload ())
+  in
+  ensure_payload ();
+  buffer_ref :=
+    String.sub !buffer_ref payload_length
+      (String.length !buffer_ref - payload_length);
+  if
+    String.length !buffer_ref >= 2
+    && !buffer_ref.[0] = '\r'
+    && !buffer_ref.[1] = '\n'
+  then buffer_ref := String.sub !buffer_ref 2 (String.length !buffer_ref - 2)
+
 let connect_to_master ~host ~port ~listening_port =
   let inet = Unix.inet_addr_of_string host in
   let deadline = Unix.gettimeofday () +. 5.0 in
@@ -209,9 +262,7 @@ let connect_to_master ~host ~port ~listening_port =
         | _ -> failwith "unexpected FULLRESYNC line")
     | _ -> failwith "expected FULLRESYNC simple string"
   in
-  (match read_frame_blocking fd handshake_buffer with
-  | Resp.Bulk_string_frame _ -> ()
-  | _ -> failwith "expected RDB bulk payload after FULLRESYNC");
+  read_rdb_payload_blocking fd handshake_buffer;
   { host; port; fd; buffer = ""; replid; offset; link_status = "up" }
 
 let run ~port ~replicaof ~rdb_file ~requirepass =

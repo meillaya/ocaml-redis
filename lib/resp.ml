@@ -110,25 +110,27 @@ let parse_request input =
 let parse_frame input =
   if String.length input = 0 then None
   else
-    match input.[0] with
-    | '*' ->
-        Option.map
-          (Result.map (fun (args, consumed) -> (Command_frame args, consumed)))
-          (parse_request input)
-    | '+' -> (
-        match parse_line input ~start:1 with
-        | None -> None
-        | Some (line, consumed) ->
-            Some (Stdlib.Ok (Simple_string_frame line, consumed)))
-    | '-' -> (
-        match parse_line input ~start:1 with
-        | None -> None
-        | Some (line, consumed) -> Some (Stdlib.Ok (Error_frame line, consumed))
-        )
-    | '$' -> (
-        match parse_bulk_string input ~start:1 with
-        | None -> None
-        | Some (Stdlib.Error _ as error) -> Some error
-        | Some (Stdlib.Ok (payload, consumed)) ->
-            Some (Stdlib.Ok (Bulk_string_frame payload, consumed)))
-    | _ -> Some (Stdlib.Error "protocol error: unsupported frame type")
+    try
+      match input.[0] with
+      | '*' ->
+          Option.map
+            (Result.map (fun (args, consumed) -> (Command_frame args, consumed)))
+            (parse_request input)
+      | '+' -> (
+          match parse_line input ~start:1 with
+          | None -> None
+          | Some (line, consumed) ->
+              Some (Stdlib.Ok (Simple_string_frame line, consumed)))
+      | '-' -> (
+          match parse_line input ~start:1 with
+          | None -> None
+          | Some (line, consumed) ->
+              Some (Stdlib.Ok (Error_frame line, consumed)))
+      | '$' -> (
+          match parse_bulk_string input ~start:1 with
+          | None -> None
+          | Some (Stdlib.Error _ as error) -> Some error
+          | Some (Stdlib.Ok (payload, consumed)) ->
+              Some (Stdlib.Ok (Bulk_string_frame payload, consumed)))
+      | _ -> Some (Stdlib.Error "protocol error: unsupported frame type")
+    with Exit -> None
