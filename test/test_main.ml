@@ -1,6 +1,29 @@
 let fail message = raise (Failure message)
 let next_test_port = ref 41000
 
+let discover_server_executable () =
+  let from_test_executable () =
+    let test_executable = Unix.realpath Sys.executable_name in
+    let test_dir = Filename.dirname test_executable in
+    Filename.concat (Filename.dirname test_dir) "app/server_main.exe"
+  in
+  let candidates =
+    [
+      from_test_executable ();
+      Filename.concat (Sys.getcwd ()) "_build/default/app/server_main.exe";
+      Filename.concat (Sys.getcwd ()) "app/server_main.exe";
+      "../app/server_main.exe";
+    ]
+  in
+  match List.find_opt Sys.file_exists candidates with
+  | Some path -> path
+  | None ->
+      fail
+        ("could not locate server_main.exe; tried: "
+        ^ String.concat ", " candidates)
+
+let server_executable = discover_server_executable ()
+
 let assert_int64_equal ~expected ~actual ~context =
   if expected <> actual then
     fail (Printf.sprintf "%s: expected %Ld but got %Ld" context expected actual)
@@ -86,9 +109,8 @@ let with_server ?replicaof ?rdb_file ?requirepass test_fn =
     loop ()
   in
   let port = discover_port () in
-  let executable = "../app/server_main.exe" in
   let argv =
-    let base = [ executable; "--port"; string_of_int port ] in
+    let base = [ server_executable; "--port"; string_of_int port ] in
     let with_replica =
       match replicaof with
       | None -> base
@@ -108,7 +130,8 @@ let with_server ?replicaof ?rdb_file ?requirepass test_fn =
     Array.of_list with_auth
   in
   let pid =
-    Unix.create_process executable argv Unix.stdin Unix.stdout Unix.stderr
+    Unix.create_process server_executable argv Unix.stdin Unix.stdout
+      Unix.stderr
   in
   Fun.protect
     ~finally:(fun () ->
@@ -171,10 +194,9 @@ let retry_until timeout_seconds f =
   loop ()
 
 let with_spawned_server argv test_fn =
-  let executable = "../app/server_main.exe" in
   let pid =
-    Unix.create_process executable
-      (Array.of_list (executable :: argv))
+    Unix.create_process server_executable
+      (Array.of_list (server_executable :: argv))
       Unix.stdin Unix.stdout Unix.stderr
   in
   Fun.protect
@@ -1427,12 +1449,11 @@ let test_auth_gate_matrix () =
             ~context:"subscribed mode takes precedence after auth"))
 
 let test_startup_config_validation_bundle () =
-  let executable = "../app/server_main.exe" in
   let run argv =
     let devnull = Unix.openfile "/dev/null" [ Unix.O_WRONLY ] 0 in
     let pid =
-      Unix.create_process executable
-        (Array.of_list (executable :: argv))
+      Unix.create_process server_executable
+        (Array.of_list (server_executable :: argv))
         Unix.stdin devnull devnull
     in
     let _, status = Unix.waitpid [] pid in
@@ -1503,12 +1524,11 @@ let test_auth_startup_rejects_replica_mode () =
   incr next_test_port;
   let upstream_port = !next_test_port in
   incr next_test_port;
-  let executable = "../app/server_main.exe" in
   let devnull = Unix.openfile "/dev/null" [ Unix.O_WRONLY ] 0 in
   let pid =
-    Unix.create_process executable
+    Unix.create_process server_executable
       [|
-        executable;
+        server_executable;
         "--port";
         string_of_int port;
         "--replicaof";

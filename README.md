@@ -539,6 +539,18 @@ Run the full regression suite:
 dune test --display=short
 ```
 
+If you run plain `dune test`, Dune may show very little output when everything passes. That is expected in this repository because the test runner is a simple executable that raises on failure and prints `PASS: ...` lines on success, while Dune often suppresses successful stdout by default.
+
+If you want to see the individual passing test names, use one of these forms:
+
+```sh
+dune test --display=short
+dune runtest --no-buffer
+dune exec test/test_main.exe
+```
+
+The direct executable form now works from the repository root as well as through Dune's normal test flow.
+
 The automated test suite covers:
 
 - deterministic expiry behavior
