@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate release notes from tag annotation / commit context
+        id: notes
+        run: |
+          tag_name="${GITHUB_REF_NAME}"
+          if [ -f CHANGELOG.md ]; then
+            notes=$(awk -v tag="$tag_name" '
+              BEGIN {
+                version=substr(tag,2)
+                in_section=0
+              }
+              $0 ~ "^## \\[" version "\\]" {
+                in_section=1
+                next
+              }
+              /^## \[/ && in_section {
+                exit
+              }
+              in_section {
+                print
+              }
+            ' CHANGELOG.md)
+          fi
+
+          if [ -z "$notes" ]; then
+            notes="Release ${tag_name}"
+          fi
+
+          {
+            echo 'body<<EOF'
+            echo "$notes"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.notes.outputs.body }}
+          generate_release_notes: false

@@ -1,5 +1,7 @@
 # ocaml-redis
 
+[![CI](https://github.com/Meillaya/ocaml-redis/actions/workflows/ci.yml/badge.svg)](https://github.com/Meillaya/ocaml-redis/actions/workflows/ci.yml)
+
 A correctness-first Redis learning implementation in OCaml.
 
 This project is not trying to be a full Redis clone yet. It is a deliberately scoped, test-driven implementation of a substantial Redis-compatible subset, built to study protocol parsing, server design, data-structure semantics, replication basics, and how OCaml's type system and module structure support correctness.

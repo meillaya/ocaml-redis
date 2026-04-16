@@ -70,3 +70,5 @@ The format is inspired by Keep a Changelog, adapted for this learning-project re
 - Auth live conformance against a dedicated auth-configured daemon is not included yet.
 - Geospatial and sorted-set interoperability remains intentionally partial and documented as such.
 - This remains a learning-project subset, not a full Redis-compatible production server.
+
+[0.1.0]: https://github.com/Meillaya/ocaml-redis/releases/tag/v0.1.0
