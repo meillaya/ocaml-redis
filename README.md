@@ -556,6 +556,24 @@ The automated test suite covers:
 
 If you have a live Redis-compatible server already running on port `6379`, you can test replica startup and propagation manually.
 
+Important current limitation: the replication subset supports handshake, streaming command propagation, replica acknowledgements, and `WAIT`, but it still uses an **empty** full-resync RDB transfer. That means the replica does **not** import the upstream server's pre-existing dataset at connect time. Only writes made **after** the replica is connected are expected to appear on the replica.
+
+So if a key already exists on the upstream before replica startup, this is expected with the current implementation:
+
+```sh
+redis-cli -p 6379 SET preexisting value
+dune exec app/server_main.exe -- --port 6381 --replicaof 127.0.0.1:6379
+redis-cli -p 6381 GET preexisting
+```
+
+Expected output right now:
+
+```text
+(nil)
+```
+
+To test the currently supported behavior correctly, start the replica first and then write new values to the upstream.
+
 First confirm the upstream server is reachable:
 
 ```sh
