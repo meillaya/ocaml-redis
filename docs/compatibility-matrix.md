@@ -56,7 +56,7 @@ This document describes the current compatibility posture of `ocaml-redis` relat
 | Area | Status | Notes |
 |---|---|---|
 | `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH` | Partial subset | Core channel pub/sub only |
-| `UNSUBSCRIBE` without arguments | Supported-compatible | Includes RESP2 nil/no-subscription shape and reverse-order unwind of active channel subscriptions |
+| `UNSUBSCRIBE` without arguments | Supported-compatible | Includes RESP2 nil/no-subscription shape and unsubscribe-all acknowledgements in subscription order |
 | `PING` in subscribed mode | Supported-compatible | Includes empty-payload `pong` array shape for bare `PING` |
 | Pattern subscriptions / broader pubsub surface | Deliberate incompatibility | Not implemented |
 

@@ -311,7 +311,7 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
            Resp.Bulk_string (Some (Option.value ~default:"" message));
          ])
   in
-  let subscribed_channels client = client.subscription_order_rev in
+  let subscribed_channels client = List.rev client.subscription_order_rev in
   let channels_to_unsubscribe client channels =
     if channels = [] then subscribed_channels client else channels
   in

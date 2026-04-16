@@ -1236,17 +1236,18 @@ let test_pubsub_unsubscribe_all_and_ping_edges () =
               "*3\r\n\
                $11\r\n\
                unsubscribe\r\n\
-               $6\r\n\
-               second\r\n\
+               $5\r\n\
+               first\r\n\
                :1\r\n\
                *3\r\n\
                $11\r\n\
                unsubscribe\r\n\
-               $5\r\n\
-               first\r\n\
+               $6\r\n\
+               second\r\n\
                :0\r\n"
             ~actual:(read_until_quiet subscriber)
-            ~context:"unsubscribe all unwinds subscriptions in reverse order";
+            ~context:
+              "unsubscribe all unwinds subscriptions in subscription order";
           assert_string_equal ~expected:"+PONG\r\n"
             ~actual:(send_command subscriber [ "PING" ])
             ~context:"after final unsubscribe client leaves subscribed mode"))
