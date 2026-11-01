@@ -17,6 +17,8 @@ type stream_write_error =
 type stream_read_error = [ wrong_type | `Invalid_stream_id of string ]
 
 val create : unit -> t
+val clear : t -> unit
+val memory_usage : t -> int64
 val key_type : now_ms:int64 -> t -> string -> key_type
 val watch_version : now_ms:int64 -> t -> string -> int64
 val get_string : now_ms:int64 -> t -> string -> string lookup

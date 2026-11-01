@@ -108,7 +108,8 @@ let assert_some_int64_equal value ~expected ~context =
   | Some actual -> assert_int64_equal ~expected ~actual ~context
   | None -> fail (context ^ ": expected Some value")
 
-let with_server_process ?replicaof ?rdb_file ?requirepass ?masterauth test_fn =
+let with_server_process ?replicaof ?rdb_file ?requirepass ?masterauth
+    ?maxclients ?max_output_buffer ?maxmemory ?tls_cert ?tls_key test_fn =
   let discover_port () =
     let rec loop () =
       let port = !next_test_port in
@@ -170,7 +171,30 @@ let with_server_process ?replicaof ?rdb_file ?requirepass ?masterauth test_fn =
       | None -> with_auth
       | Some password -> with_auth @ [ "--masterauth"; password ]
     in
-    Array.of_list with_masterauth
+    let with_maxclients =
+      match maxclients with
+      | None -> with_masterauth
+      | Some count -> with_masterauth @ [ "--maxclients"; string_of_int count ]
+    in
+    let with_output_buffer =
+      match max_output_buffer with
+      | None -> with_maxclients
+      | Some bytes ->
+          with_maxclients @ [ "--max-output-buffer"; string_of_int bytes ]
+    in
+    let with_maxmemory =
+      match maxmemory with
+      | None -> with_output_buffer
+      | Some bytes ->
+          with_output_buffer @ [ "--maxmemory"; Int64.to_string bytes ]
+    in
+    let with_tls =
+      match (tls_cert, tls_key) with
+      | Some cert, Some key ->
+          with_maxmemory @ [ "--tls-cert"; cert; "--tls-key"; key ]
+      | _ -> with_maxmemory
+    in
+    Array.of_list with_tls
   in
   let pid =
     Unix.create_process server_executable argv Unix.stdin Unix.stdout
@@ -182,8 +206,10 @@ let with_server_process ?replicaof ?rdb_file ?requirepass ?masterauth test_fn =
       ignore (Unix.waitpid [] pid))
     (fun () -> test_fn ~port ~pid ~connect:(fun () -> connect_with_retry port))
 
-let with_server ?replicaof ?rdb_file ?requirepass ?masterauth test_fn =
-  with_server_process ?replicaof ?rdb_file ?requirepass ?masterauth
+let with_server ?replicaof ?rdb_file ?requirepass ?masterauth ?maxclients
+    ?max_output_buffer ?maxmemory ?tls_cert ?tls_key test_fn =
+  with_server_process ?replicaof ?rdb_file ?requirepass ?masterauth ?maxclients
+    ?max_output_buffer ?maxmemory ?tls_cert ?tls_key
     (fun ~port ~pid:_ ~connect -> test_fn ~port ~connect)
 
 let resolve_host host =
@@ -298,14 +324,14 @@ let parse_bulk_string_reply reply =
       value
   | _ -> fail ("expected bulk string reply, got " ^ reply)
 
-let retry_until timeout_seconds f =
+let retry_until ?(context = "condition") timeout_seconds f =
   let deadline = Unix.gettimeofday () +. timeout_seconds in
   let rec loop () =
     match f () with
     | Some value -> value
     | None ->
         if Unix.gettimeofday () >= deadline then
-          fail "timed out waiting for condition"
+          fail ("timed out waiting for " ^ context)
         else (
           Unix.sleepf 0.05;
           loop ())
@@ -492,47 +518,170 @@ let with_spawned_server argv test_fn =
       ignore (Unix.waitpid [] pid))
     (fun () -> test_fn pid)
 
-let with_temp_rdb entries test_fn =
-  let write_len oc len =
-    if len < 64 then output_byte oc len
+let build_rdb entries =
+  let buffer = Buffer.create 128 in
+  let add_byte value = Buffer.add_char buffer (Char.chr (value land 0xff)) in
+  let add_len len =
+    if len < 64 then add_byte len
     else fail "test fixture only supports small RDB strings"
   in
-  let write_string oc value =
-    write_len oc (String.length value);
-    output_string oc value
+  let add_string value =
+    add_len (String.length value);
+    Buffer.add_string buffer value
   in
-  let write_u64_le oc value =
-    let open Int64 in
+  let add_u64_le value =
     for shift = 0 to 7 do
-      output_byte oc
-        (to_int (logand (shift_right_logical value (8 * shift)) 0xffL))
+      add_byte
+        (Int64.to_int
+           (Int64.logand (Int64.shift_right_logical value (8 * shift)) 0xffL))
     done
   in
+  Buffer.add_string buffer "REDIS0009";
+  add_byte 254;
+  add_byte 0;
+  List.iter
+    (fun (key, value, expires_at_ms) ->
+      Option.iter
+        (fun expires_at_ms ->
+          add_byte 252;
+          add_u64_le expires_at_ms)
+        expires_at_ms;
+      add_byte 0;
+      add_string key;
+      add_string value)
+    entries;
+  add_byte 255;
+  for _ = 1 to 8 do
+    add_byte 0
+  done;
+  Buffer.contents buffer
+
+let with_temp_rdb entries test_fn =
+  let data = build_rdb entries in
   let path = Filename.temp_file "ocaml-redis" ".rdb" in
   Fun.protect
     ~finally:(fun () -> if Sys.file_exists path then Sys.remove path)
     (fun () ->
       let oc = open_out_bin path in
-      output_string oc "REDIS0009";
-      output_byte oc 254;
-      output_byte oc 0;
-      List.iter
-        (fun (key, value, expires_at_ms) ->
-          Option.iter
-            (fun expires_at_ms ->
-              output_byte oc 252;
-              write_u64_le oc expires_at_ms)
-            expires_at_ms;
-          output_byte oc 0;
-          write_string oc key;
-          write_string oc value)
-        entries;
-      output_byte oc 255;
-      for _ = 1 to 8 do
-        output_byte oc 0
-      done;
+      output_string oc data;
       close_out oc;
       test_fn path)
+
+let read_command fd buffer_ref =
+  let rec loop () =
+    match Redis.Resp.parse_frame !buffer_ref with
+    | Some (Ok (Redis.Resp.Command_frame arguments, consumed)) ->
+        buffer_ref :=
+          String.sub !buffer_ref consumed (String.length !buffer_ref - consumed);
+        arguments
+    | Some (Ok _) -> fail "fake master: expected a command frame"
+    | Some (Error message) -> fail ("fake master: " ^ message)
+    | None ->
+        let chunk = Bytes.create 4096 in
+        let read = Unix.read fd chunk 0 (Bytes.length chunk) in
+        if read = 0 then fail "fake master: connection closed";
+        buffer_ref := !buffer_ref ^ Bytes.sub_string chunk 0 read;
+        loop ()
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> loop ()
+  in
+  loop ()
+
+let wait_for_psync fd =
+  let buffer = ref "" in
+  let rec loop () =
+    match read_command fd buffer with
+    | [ "PING" ] ->
+        send_raw_string fd "+PONG\r\n";
+        loop ()
+    | [ "REPLCONF"; _; _ ] ->
+        send_raw_string fd "+OK\r\n";
+        loop ()
+    | [ "PSYNC"; replid; offset ] -> (replid, offset)
+    | _ -> loop ()
+  in
+  loop ()
+
+let send_full_resync fd replid rdb =
+  send_raw_string fd
+    (Printf.sprintf "+FULLRESYNC %s 0\r\n$%d\r\n" replid (String.length rdb));
+  send_raw_string fd rdb
+
+let fake_master_process listen_fd rdb =
+  let replid = String.make 40 'a' in
+  let first, _ = Unix.accept listen_fd in
+  ignore (wait_for_psync first);
+  send_full_resync first replid rdb;
+  let first_set = Redis.Resp.encode_command [ "SET"; "k1"; "v1" ] in
+  send_raw_string first first_set;
+  Unix.sleepf 0.4;
+  Unix.close first;
+  let second, _ = Unix.accept listen_fd in
+  let replid_argument, offset_argument = wait_for_psync second in
+  let expected_offset = Int64.of_int (String.length first_set) in
+  let continuing =
+    replid_argument = replid
+    && Int64.of_string_opt offset_argument = Some expected_offset
+  in
+  if continuing then
+    send_raw_string second (Printf.sprintf "+CONTINUE %s\r\n" replid)
+  else send_full_resync second replid rdb;
+  send_raw_string second (Redis.Resp.encode_command [ "SET"; "k2"; "v2" ]);
+  let buffer = ref "" in
+  (try
+     while true do
+       ignore (read_command second buffer)
+     done
+   with Failure _ -> ());
+  Unix.close second
+
+let fake_master_transaction_process listen_fd rdb =
+  let replid = String.make 40 'b' in
+  let fd, _ = Unix.accept listen_fd in
+  ignore (wait_for_psync fd);
+  send_full_resync fd replid rdb;
+  send_raw_string fd (Redis.Resp.encode_command [ "MULTI" ]);
+  send_raw_string fd (Redis.Resp.encode_command [ "SET"; "k3"; "a" ]);
+  Unix.sleepf 2.0;
+  send_raw_string fd (Redis.Resp.encode_command [ "SET"; "k4"; "b" ]);
+  send_raw_string fd (Redis.Resp.encode_command [ "EXEC" ]);
+  let buffer = ref "" in
+  (try
+     while true do
+       ignore (read_command fd buffer)
+     done
+   with Failure _ -> ());
+  Unix.close fd
+
+let with_fake_master_with serve ~rdb test_fn =
+  let listen_fd = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Unix.setsockopt listen_fd Unix.SO_REUSEADDR true;
+  Unix.bind listen_fd (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+  Unix.listen listen_fd 1;
+  let port =
+    match Unix.getsockname listen_fd with
+    | Unix.ADDR_INET (_, port) -> port
+    | _ -> fail "fake master: expected an inet socket"
+  in
+  match Unix.fork () with
+  | 0 ->
+      (try serve listen_fd rdb
+       with exception_ ->
+         prerr_endline ("fake master: " ^ Printexc.to_string exception_));
+      Unix.close listen_fd;
+      exit 0
+  | pid ->
+      Unix.close listen_fd;
+      Fun.protect
+        ~finally:(fun () ->
+          (try Unix.kill pid Sys.sigterm with Unix.Unix_error _ -> ());
+          ignore (Unix.waitpid [] pid))
+        (fun () -> test_fn ~port)
+
+let with_fake_master ~rdb test_fn =
+  with_fake_master_with fake_master_process ~rdb test_fn
+
+let with_fake_master_transaction ~rdb test_fn =
+  with_fake_master_with fake_master_transaction_process ~rdb test_fn
 
 let test_manual_clock_initial () =
   let clock = Redis.Clock.Manual.create ~now_ms:1_234L in
@@ -2638,6 +2787,353 @@ let test_sha256_known_vectors () =
     "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
     "sha256 one million a"
 
+let test_connection_limit () =
+  with_server ~maxclients:1 (fun ~port:_ ~connect ->
+      let first = connect () in
+      let second = connect () in
+      let first_open = ref true in
+      Fun.protect
+        ~finally:(fun () ->
+          if !first_open then Unix.close first;
+          Unix.close second)
+        (fun () ->
+          assert_string_equal ~expected:"-ERR max number of clients reached\r\n"
+            ~actual:(read_reply second)
+            ~context:"connection above maxclients is rejected";
+          Unix.close first;
+          first_open := false;
+          Unix.sleepf 0.5;
+          let third = connect () in
+          Fun.protect
+            ~finally:(fun () -> Unix.close third)
+            (fun () ->
+              assert_string_equal ~expected:"+PONG\r\n"
+                ~actual:(send_command third [ "PING" ])
+                ~context:"a slot reopens after a client disconnects")))
+
+let test_output_buffer_limit () =
+  with_server ~max_output_buffer:1 (fun ~port:_ ~connect ->
+      let client = connect () in
+      Fun.protect
+        ~finally:(fun () -> Unix.close client)
+        (fun () ->
+          send_only client [ "PING" ];
+          match read_reply client with
+          | exception Failure _ -> ()
+          | reply ->
+              fail
+                ("expected the over-limit output buffer to close the \
+                  client,                   got " ^ reply)))
+
+let test_maxmemory_limit () =
+  with_server ~maxmemory:1L (fun ~port:_ ~connect ->
+      let client = connect () in
+      Fun.protect
+        ~finally:(fun () -> Unix.close client)
+        (fun () ->
+          assert_string_equal ~expected:"+OK\r\n"
+            ~actual:(send_command client [ "SET"; "first"; "value" ])
+            ~context:"first write fits under the empty-memory limit";
+          assert_string_equal
+            ~expected:
+              "-ERR OOM command not allowed when used memory > 'maxmemory'.\r\n"
+            ~actual:(send_command client [ "SET"; "second"; "value" ])
+            ~context:"write above maxmemory is rejected";
+          assert_string_equal ~expected:"$5\r\nvalue\r\n"
+            ~actual:(send_command client [ "GET"; "first" ])
+            ~context:"reads remain available when maxmemory is reached";
+          let info = send_command client [ "INFO"; "memory" ] in
+          assert_contains ~needle:"maxmemory:1" ~haystack:info
+            ~context:"info memory reports maxmemory";
+          assert_contains ~needle:"maxmemory_policy:noeviction" ~haystack:info
+            ~context:"info memory reports the noeviction policy";
+          assert_contains ~needle:"used_memory:" ~haystack:info
+            ~context:"info memory reports used_memory"))
+
+let test_full_resync_import_and_partial_resync () =
+  let rdb = build_rdb [ ("preexisting", "old", None) ] in
+  with_fake_master ~rdb (fun ~port:upstream_port ->
+      with_server ~replicaof:("127.0.0.1", upstream_port)
+        (fun ~port:_ ~connect ->
+          let replica = connect () in
+          Fun.protect
+            ~finally:(fun () -> Unix.close replica)
+            (fun () ->
+              ignore
+                (retry_until ~context:"initial replica link" 5.0 (fun () ->
+                     let reply =
+                       send_command replica [ "INFO"; "replication" ]
+                     in
+                     if string_contains reply "master_link_status:up" then
+                       Some reply
+                     else None));
+              ignore
+                (retry_until ~context:"imported RDB key" 2.0 (fun () ->
+                     let reply =
+                       send_command replica [ "GET"; "preexisting" ]
+                     in
+                     if reply = "$3\r\nold\r\n" then Some reply else None));
+              ignore
+                (retry_until ~context:"first post-resync write" 2.0 (fun () ->
+                     let reply = send_command replica [ "GET"; "k1" ] in
+                     if reply = "$2\r\nv1\r\n" then Some reply else None));
+              ignore
+                (retry_until ~context:"partial resync write" 8.0 (fun () ->
+                     let reply = send_command replica [ "GET"; "k2" ] in
+                     if reply = "$2\r\nv2\r\n" then Some reply else None));
+              assert_string_equal ~expected:"$3\r\nold\r\n"
+                ~actual:(send_command replica [ "GET"; "preexisting" ])
+                ~context:"partial resync keeps the full-resync dataset";
+              assert_string_equal ~expected:"$2\r\nv1\r\n"
+                ~actual:(send_command replica [ "GET"; "k1" ])
+                ~context:"partial resync keeps pre-disconnect writes")))
+
+let test_replica_transaction_atomicity () =
+  let rdb = build_rdb [] in
+  with_fake_master_transaction ~rdb (fun ~port:upstream_port ->
+      with_server ~replicaof:("127.0.0.1", upstream_port)
+        (fun ~port:_ ~connect ->
+          let replica = connect () in
+          Fun.protect
+            ~finally:(fun () -> Unix.close replica)
+            (fun () ->
+              ignore
+                (retry_until ~context:"transaction replica link" 5.0 (fun () ->
+                     let reply =
+                       send_command replica [ "INFO"; "replication" ]
+                     in
+                     if string_contains reply "master_link_status:up" then
+                       Some reply
+                     else None));
+              Unix.sleepf 0.2;
+              assert_string_equal ~expected:"$-1\r\n"
+                ~actual:(send_command replica [ "GET"; "k3" ])
+                ~context:"queued transaction write is invisible before EXEC";
+              ignore
+                (retry_until ~context:"committed transaction write" 5.0
+                   (fun () ->
+                     let reply = send_command replica [ "GET"; "k4" ] in
+                     if reply = "$1\r\nb\r\n" then Some reply else None));
+              assert_string_equal ~expected:"$1\r\na\r\n"
+                ~actual:(send_command replica [ "GET"; "k3" ])
+                ~context:"EXEC commits every queued write atomically")))
+
+let test_replication_propagates_transactions () =
+  with_server (fun ~port:master_port ~connect:connect_master ->
+      with_server ~replicaof:("127.0.0.1", master_port)
+        (fun ~port:_ ~connect:connect_replica ->
+          let master = connect_master () in
+          let replica = connect_replica () in
+          Fun.protect
+            ~finally:(fun () ->
+              Unix.close master;
+              Unix.close replica)
+            (fun () ->
+              ignore
+                (retry_until ~context:"transaction replica link" 5.0 (fun () ->
+                     let reply =
+                       send_command replica [ "INFO"; "replication" ]
+                     in
+                     if string_contains reply "master_link_status:up" then
+                       Some reply
+                     else None));
+              ignore (send_command master [ "MULTI" ]);
+              ignore (send_command master [ "SET"; "tx:a"; "1" ]);
+              ignore (send_command master [ "SET"; "tx:b"; "2" ]);
+              assert_string_equal ~expected:"*2\r\n+OK\r\n+OK\r\n"
+                ~actual:(send_command master [ "EXEC" ])
+                ~context:"transaction exec reply";
+              ignore
+                (retry_until ~context:"transaction key a" 2.0 (fun () ->
+                     let reply = send_command replica [ "GET"; "tx:a" ] in
+                     if reply = "$1\r\n1\r\n" then Some reply else None));
+              ignore
+                (retry_until ~context:"transaction key b" 2.0 (fun () ->
+                     let reply = send_command replica [ "GET"; "tx:b" ] in
+                     if reply = "$1\r\n2\r\n" then Some reply else None)))))
+
+let test_master_serves_partial_resync () =
+  with_server (fun ~port:_ ~connect ->
+      let writer = connect () in
+      let replica = connect () in
+      let replica_open = ref true in
+      Fun.protect
+        ~finally:(fun () ->
+          Unix.close writer;
+          if !replica_open then Unix.close replica)
+        (fun () ->
+          assert_string_equal ~expected:"+PONG\r\n"
+            ~actual:(send_command replica [ "PING" ])
+            ~context:"fake replica ping";
+          ignore (send_command replica [ "REPLCONF"; "capa"; "psync2" ]);
+          send_only replica [ "PSYNC"; "?"; "-1" ];
+          let sync_reply = read_until_quiet replica in
+          let first_line =
+            match String.split_on_char '\r' sync_reply with
+            | line :: _ -> line
+            | [] -> fail "empty PSYNC reply"
+          in
+          let replid, initial_offset =
+            match String.split_on_char ' ' first_line with
+            | [ "+FULLRESYNC"; replid; offset_text ] -> (
+                match Int64.of_string_opt offset_text with
+                | Some offset -> (replid, offset)
+                | None -> fail "invalid FULLRESYNC offset in test")
+            | _ -> fail ("unexpected FULLRESYNC line: " ^ first_line)
+          in
+          assert_contains ~needle:"$0\r\n\r\n" ~haystack:sync_reply
+            ~context:"initial full resync payload";
+          ignore (send_command writer [ "SET"; "backlog:a"; "1" ]);
+          let first_stream = read_until_quiet replica in
+          assert_string_equal
+            ~expected:(Redis.Resp.encode_command [ "SET"; "backlog:a"; "1" ])
+            ~actual:first_stream ~context:"first replicated streamed write";
+          let resume_offset =
+            Int64.add initial_offset (Int64.of_int (String.length first_stream))
+          in
+          Unix.close replica;
+          replica_open := false;
+          ignore (send_command writer [ "SET"; "backlog:b"; "2" ]);
+          let resumed = connect () in
+          Fun.protect
+            ~finally:(fun () -> Unix.close resumed)
+            (fun () ->
+              ignore (send_command resumed [ "PING" ]);
+              ignore (send_command resumed [ "REPLCONF"; "capa"; "psync2" ]);
+              send_only resumed
+                [ "PSYNC"; replid; Int64.to_string resume_offset ];
+              let continued = read_until_quiet resumed in
+              assert_contains ~needle:"+CONTINUE " ~haystack:continued
+                ~context:"partial resync continues instead of resyncing";
+              assert_contains
+                ~needle:(Redis.Resp.encode_command [ "SET"; "backlog:b"; "2" ])
+                ~haystack:continued
+                ~context:"partial resync replays the missed write";
+              assert_bool
+                (not
+                   (string_contains continued
+                      (Redis.Resp.encode_command [ "SET"; "backlog:a"; "1" ])))
+                ~context:"partial resync does not replay already-seen writes")))
+
+let with_test_certificate test_fn =
+  let directory = Filename.temp_file "ocaml-redis-tls" "" in
+  Sys.remove directory;
+  Unix.mkdir directory 0o700;
+  let certificate = Filename.concat directory "cert.pem" in
+  let key = Filename.concat directory "key.pem" in
+  let cleanup () =
+    (try Sys.remove certificate with Sys_error _ -> ());
+    (try Sys.remove key with Sys_error _ -> ());
+    try Unix.rmdir directory with Unix.Unix_error _ -> ()
+  in
+  Fun.protect ~finally:cleanup (fun () ->
+      let command =
+        Printf.sprintf
+          "openssl req -x509 -newkey rsa:2048 -sha256 -nodes -keyout %s \
+           -out            %s -days 1 -subj /CN=localhost >/dev/null 2>&1"
+          (Filename.quote key)
+          (Filename.quote certificate)
+      in
+      if Sys.command command <> 0 then
+        fail "could not generate a test TLS certificate with openssl";
+      test_fn ~certificate ~key)
+
+let tls_client_config () =
+  match X509.Authenticator.of_string "none" with
+  | Error (`Msg message) ->
+      fail ("could not build TLS authenticator: " ^ message)
+  | Ok make_authenticator -> (
+      let authenticator = make_authenticator (fun () -> None) in
+      match Tls.Config.client ~authenticator () with
+      | Ok config -> config
+      | Error (`Msg message) -> fail ("could not build TLS client: " ^ message))
+
+let test_tls_roundtrip () =
+  Mirage_crypto_rng_unix.use_default ();
+  with_test_certificate (fun ~certificate ~key ->
+      with_server ~tls_cert:certificate ~tls_key:key (fun ~port:_ ~connect ->
+          let raw = connect () in
+          let client = Tls_unix.client_of_fd (tls_client_config ()) raw in
+          Fun.protect
+            ~finally:(fun () -> Tls_unix.close client)
+            (fun () ->
+              let request = Redis.Resp.encode_command [ "PING" ] in
+              Tls_unix.write client request;
+              let buffer = Bytes.create 4096 in
+              let read = Tls_unix.read client buffer in
+              assert_string_equal ~expected:"+PONG\r\n"
+                ~actual:(Bytes.sub_string buffer 0 read)
+                ~context:"TLS ping roundtrip";
+              let set_request =
+                Redis.Resp.encode_command [ "SET"; "tls-key"; "tls-value" ]
+              in
+              Tls_unix.write client set_request;
+              let read = Tls_unix.read client buffer in
+              assert_string_equal ~expected:"+OK\r\n"
+                ~actual:(Bytes.sub_string buffer 0 read)
+                ~context:"TLS set reply";
+              let get_request =
+                Redis.Resp.encode_command [ "GET"; "tls-key" ]
+              in
+              Tls_unix.write client get_request;
+              let read = Tls_unix.read client buffer in
+              assert_string_equal ~expected:"$9\r\ntls-value\r\n"
+                ~actual:(Bytes.sub_string buffer 0 read)
+                ~context:"TLS get reply")))
+
+let test_failed_writes_are_not_replicated () =
+  with_server (fun ~port:master_port ~connect:connect_master ->
+      let seed = connect_master () in
+      Fun.protect
+        ~finally:(fun () -> Unix.close seed)
+        (fun () -> ignore (send_command seed [ "SET"; "n"; "abc" ]));
+      with_server ~replicaof:("127.0.0.1", master_port)
+        (fun ~port:_ ~connect:connect_replica ->
+          let master = connect_master () in
+          let replica = connect_replica () in
+          Fun.protect
+            ~finally:(fun () ->
+              Unix.close master;
+              Unix.close replica)
+            (fun () ->
+              ignore
+                (retry_until ~context:"failed-write replica link" 5.0 (fun () ->
+                     let reply =
+                       send_command replica [ "INFO"; "replication" ]
+                     in
+                     if string_contains reply "master_link_status:up" then
+                       Some reply
+                     else None));
+              assert_string_equal ~expected:"$-1\r\n"
+                ~actual:(send_command replica [ "GET"; "n" ])
+                ~context:"replica starts without the pre-connect seed key";
+              assert_string_equal
+                ~expected:"-ERR value is not an integer or out of range\r\n"
+                ~actual:(send_command master [ "INCR"; "n" ])
+                ~context:"master rejects a non-integer increment";
+              Unix.sleepf 0.2;
+              assert_string_equal ~expected:"$-1\r\n"
+                ~actual:(send_command replica [ "GET"; "n" ])
+                ~context:"failed write is not propagated";
+              ignore (send_command master [ "MULTI" ]);
+              ignore (send_command master [ "SET"; "tx-good"; "1" ]);
+              ignore (send_command master [ "INCR"; "n" ]);
+              assert_string_equal
+                ~expected:
+                  "*2\r\n\
+                   +OK\r\n\
+                   -ERR value is not an integer or out of range\r\n"
+                ~actual:(send_command master [ "EXEC" ])
+                ~context:"transaction exec includes the failed write";
+              ignore
+                (retry_until ~context:"successful transaction write" 2.0
+                   (fun () ->
+                     let reply = send_command replica [ "GET"; "tx-good" ] in
+                     if reply = "$1\r\n1\r\n" then Some reply else None));
+              assert_string_equal ~expected:"$-1\r\n"
+                ~actual:(send_command replica [ "GET"; "n" ])
+                ~context:"failed transaction write is not propagated")))
+
 let tests =
   [
     ("manual clock starts at configured instant", test_manual_clock_initial);
@@ -2755,6 +3251,20 @@ let tests =
       test_error_replies_cannot_inject_frames );
     ( "transactions support PUBLISH and INFO",
       test_transactions_support_publish_and_info );
+    ("the connection limit rejects excess clients", test_connection_limit);
+    ("the output buffer limit closes slow readers", test_output_buffer_limit);
+    ("maxmemory rejects writes with an OOM error", test_maxmemory_limit);
+    ( "full resync imports data and partial resync continues the stream",
+      test_full_resync_import_and_partial_resync );
+    ( "replica transactions stay invisible until EXEC",
+      test_replica_transaction_atomicity );
+    ( "master propagates transactions to replicas",
+      test_replication_propagates_transactions );
+    ( "master serves PSYNC continuation from its backlog",
+      test_master_serves_partial_resync );
+    ("TLS clients can exchange RESP commands", test_tls_roundtrip);
+    ( "failed writes and failed transaction writes are not replicated",
+      test_failed_writes_are_not_replicated );
   ]
 
 let run_tests tests =

@@ -56,16 +56,19 @@ relative to real Redis for the implemented subset.
 | Area | Status | Notes |
 |---|---|---|
 | `INFO replication` | Partial subset | Replication-focused section only |
+| `INFO memory` | Partial subset | Reports `used_memory`, `maxmemory`, policy, and client counts |
 | `REPLCONF`, `PSYNC ? -1` | Partial subset | Enough for the current master/replica handshake |
 | Replica authentication | Supported-compatible | `--masterauth` sends `AUTH` before `REPLCONF`/`PSYNC` |
 | Authenticated `PSYNC` | Supported-compatible | Required when `--requirepass` is configured |
 | Empty RDB full resync | Partial subset | This server sends an empty payload |
-| Non-empty RDB full resync | Deliberate incompatibility | Payload is discarded with a warning; existing master data is not imported |
+| Non-empty RDB full resync (replica side) | Partial subset | Parsed and imported for supported string values; unsupported value types fail the sync |
+| This master's full-resync payload | Deliberate incompatibility | Empty; local data is not serialized for first-time replicas |
 | Single/multi-replica propagation | Supported-compatible | For currently implemented write commands |
 | Replicated relative expiries | Supported-compatible | Rewritten as absolute `PXAT` deadlines |
-| Transaction atomicity on replicas | Deliberate incompatibility | `EXEC` writes are propagated individually, so a replica can observe an intermediate state |
+| Transaction atomicity on replicas | Supported-compatible | `EXEC` writes are wrapped in `MULTI`/`EXEC`; the replica queues them and applies the batch before waking readers |
 | `WAIT` | Partial subset | Implemented for the current replication model |
-| Replica reconnect / partial resync | Deliberate incompatibility | Not implemented |
+| Replica reconnect / partial resync | Supported-compatible | One-second reconnect and a 4 MiB master backlog; longer gaps use full resync |
+| Transaction propagation | Supported-compatible | Wrapped in `MULTI`/`EXEC`; replicas apply the batch before waking readers |
 | Cascading replication | Deliberate incompatibility | Not implemented |
 
 ## RDB loading
@@ -115,7 +118,7 @@ relative to real Redis for the implemented subset.
 | `ACL GETUSER default` | Partial subset | Returns `flags` and `passwords` with SHA-256 digests, never cleartext; other Redis ACL fields are omitted |
 | `PSYNC` authorization | Supported-compatible | Requires authentication when `requirepass` is set |
 | Multi-user/username ACL model | Deliberate incompatibility | Not implemented |
-| TLS | Deliberate incompatibility | Not implemented; bind is loopback-only |
+| TLS | Supported-compatible | Client connections via `--tls-cert`/`--tls-key`; upstream replication and client certificates are not supported |
 
 ## Protocol and resource limits
 
@@ -124,6 +127,9 @@ relative to real Redis for the implemented subset.
 | Bulk string ceiling | Deliberate safety limit | 64 MiB per bulk string |
 | Array ceiling | Deliberate safety limit | 1,048,576 arguments per request |
 | Client input buffer ceiling | Deliberate safety limit | 128 MiB per connection |
+| `--maxclients` | Operational control | Default 1024; excess connections receive an error |
+| `--max-output-buffer` | Operational control | Default 64 MiB per client; over-limit readers are closed |
+| `--maxmemory` | Partial subset | Default 256 MiB, approximate accounting, `noeviction` policy; `0` disables |
 | Password length ceiling | Deliberate safety limit | 1,024 bytes for `AUTH`, `requirepass`, and `masterauth` |
 | Error replies | Hardened | Embedded CR/LF is flattened and diagnostics are truncated |
 | Inline commands | Deliberate incompatibility | Only RESP arrays are accepted |

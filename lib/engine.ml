@@ -14,6 +14,8 @@ type outcome = {
 type t = { store : Store.t }
 
 let create () = { store = Store.create () }
+let memory_usage state = Store.memory_usage state.store
+let clear state = Store.clear state.store
 
 let load_string state ~key ~value ~expires_at_ms =
   Store.set_string state.store ~key ~value ~expires_at_ms

@@ -41,6 +41,46 @@ type stream_read_error = [ wrong_type | `Invalid_stream_id of string ]
 type stream_id_spec = Auto_all | Auto_seq of int64 | Explicit of stream_id
 type range_bound = Min | Max | Inclusive of stream_id
 
+let list_size values =
+  List.fold_left (fun total value -> total + String.length value + 24) 0 values
+
+let zset_size zset =
+  Hashtbl.fold (fun member _ total -> total + String.length member + 32) zset 0
+
+let geo_size geo =
+  Hashtbl.fold (fun member _ total -> total + String.length member + 32) geo 0
+
+let stream_size stream =
+  List.fold_left
+    (fun total entry ->
+      total + 48
+      + List.fold_left
+          (fun fields (field, value) ->
+            fields + String.length field + String.length value + 16)
+          0 entry.fields)
+    0 stream.entries_rev
+
+let value_size = function
+  | String value -> String.length value
+  | List values -> list_size values
+  | Zset zset -> zset_size zset
+  | Geo geo -> geo_size geo
+  | Stream stream -> stream_size stream
+
+let memory_usage store =
+  let entries =
+    Hashtbl.fold
+      (fun key entry total ->
+        total + String.length key + 64 + value_size entry.value)
+      store.entries 0
+  in
+  Int64.of_int (entries + (Hashtbl.length store.versions * 32))
+
+let clear store =
+  Hashtbl.reset store.entries;
+  Hashtbl.reset store.versions;
+  store.next_version <- 0L
+
 let create () =
   {
     entries = Hashtbl.create 32;

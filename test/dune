@@ -1,4 +1,4 @@
 (test
  (name test_main)
- (libraries redis unix)
+ (libraries redis unix tls x509 tls.unix mirage-crypto-rng.unix)
  (deps ../app/server_main.exe))

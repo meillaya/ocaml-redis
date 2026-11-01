@@ -351,6 +351,10 @@ Implemented and tested:
 - replica authentication against an auth-enabled master with `--masterauth`
 - propagation to one or multiple replicas
 - replica ACK tracking via `REPLCONF ACK`
+- replica reconnect every second, with a 4 MiB master backlog for `+CONTINUE`
+  partial resync
+- non-empty full-resync RDB import for supported string values
+- `MULTI`/`EXEC` propagation so replicas apply transactions atomically
 - `WAIT`
 
 Replication preserves the things that are easy to get subtly wrong:
@@ -361,10 +365,15 @@ Replication preserves the things that are easy to get subtly wrong:
 - a blocking `BLPOP` is propagated as the `LPOP` it performed, including pops
   served by the wakeup path.
 - `XREAD` waiters are fanned out to every blocked client, not just the first.
+- transaction writes are wrapped in `MULTI`/`EXEC`; a replica queues them and
+  applies the batch before waking local readers.
 
 This is a replication-learning subset, not a full Redis replication
-implementation. A non-empty RDB payload from a real master is currently
-discarded with a warning instead of imported.
+implementation. Non-empty full-resync RDB payloads from another master are
+imported when they contain the supported string value type; unsupported value
+types fail the sync instead of being discarded. This server still emits an
+empty full-resync RDB, so a replica of this server does not receive its
+pre-existing local data.
 
 ### RDB loading subset
 
@@ -458,8 +467,8 @@ For auth specifically:
 - `ACL GETUSER default` reports the SHA-256 password digest, matching Redis
 - `--requirepass` and `--masterauth` are visible in the process argument list;
   prefer a supervised configuration if that matters for your environment
-- there is no TLS, so credentials and traffic are only as private as the
-  network path
+- client TLS is available via `--tls-cert`/`--tls-key`; replication links and
+  client-certificate authentication are not covered
 
 ## Next major milestones
 
@@ -506,6 +515,7 @@ Requirements:
 - OCaml 5.x (the pinned formatter is `ocamlformat` 0.29.0)
 - `dune` 3.22 or newer
 - `unix` from the OCaml distribution
+- the `tls` and `x509` OCaml packages for TLS
 - `ocamlformat` for formatting
 
 ### Reproducible development shell
@@ -584,6 +594,22 @@ Require a password:
 dune exec app/server_main.exe -- --requirepass secret
 ```
 
+Serve TLS on the client port:
+
+```sh
+dune exec app/server_main.exe -- \
+  --tls-cert ./cert.pem --tls-key ./key.pem
+```
+
+Then connect with a TLS-capable client:
+
+```sh
+redis-cli --tls --cacert ./cert.pem -p 6379 PING
+```
+
+TLS covers client connections. `--replicaof` replication links are still
+plaintext, and the server does not request client certificates.
+
 Example manual session with `redis-cli` or `valkey-cli`:
 
 ```sh
@@ -597,6 +623,9 @@ EXEC
 ```
 
 ## Testing
+
+The TLS test generates a short-lived self-signed certificate with `openssl`, so
+keep `openssl` on `PATH` when running the suite.
 
 Run the full regression suite:
 
@@ -634,6 +663,10 @@ The automated test suite covers:
 - replication of absolute expiries, generated stream IDs, and blocked pops
 - blocked-client resumption, XREAD fan-out, and SIGPIPE-safe disconnects
 - authentication gates for `PSYNC`/`REPLCONF` and SHA-256 ACL digests
+- `maxclients`, output-buffer, and `maxmemory` enforcement
+- full-resync RDB import, reconnect, and `+CONTINUE` partial resync
+- replica transaction isolation and `MULTI`/`EXEC` propagation
+- TLS handshakes and encrypted RESP round trips
 
 ### Opt-in live conformance lane
 
@@ -684,9 +717,9 @@ Fatal error: exception Failure("failed connecting to live server 127.0.0.1:6399 
 
 If you have a live Redis-compatible server already running on port `6379`, you can test replica startup and propagation manually.
 
-Important current limitation: the replication subset supports handshake, streaming command propagation, replica acknowledgements, and `WAIT`, but it still uses an **empty** full-resync RDB transfer. That means the replica does **not** import the upstream server's pre-existing dataset at connect time. Only writes made **after** the replica is connected are expected to appear on the replica.
+Important current limitation: this server's own full-resync payload is still **empty**, so a replica of this server does not import its pre-existing local dataset at connect time. Only writes made **after** the replica is connected are expected to appear on the replica. A replica pointed at another master does import that master's non-empty RDB when it uses the supported string value type.
 
-So if a key already exists on the upstream before replica startup, this is expected with the current implementation:
+With a real Redis or Valkey upstream, a pre-existing string key is imported during full resync:
 
 ```sh
 redis-cli -p 6379 SET preexisting value
@@ -694,13 +727,15 @@ dune exec app/server_main.exe -- --port 6381 --replicaof 127.0.0.1:6379
 redis-cli -p 6381 GET preexisting
 ```
 
-Expected output right now:
+Expected output:
 
 ```text
-(nil)
+value
 ```
 
-To test the currently supported behavior correctly, start the replica first and then write new values to the upstream.
+An `ocaml-redis` upstream still sends an empty full-resync payload, so the same
+test against it returns `(nil)` for pre-existing data. Unsupported RDB value
+types fail the replica sync rather than importing a partial dataset.
 
 First confirm the upstream server is reachable:
 
@@ -805,20 +840,30 @@ Expected output:
 The server is a learning implementation. Its defaults are deliberately
 conservative, and its remaining operational limits are explicit:
 
-- it binds to loopback only; there is no `--bind`, TLS, or authentication
-  transport
-- command execution is serialized in one `Unix.select` event loop, so a slow
-  reader can delay other clients while a reply is written
-- there are no output-buffer limits, connection limits, or `maxmemory` policy
+- it binds to loopback only; there is no `--bind`
+- client connections can use TLS via `--tls-cert`/`--tls-key`; replication
+  upstream links are still plaintext
+- TLS does not request or verify client certificates; it is server
+  authentication only
+- command execution is serialized in one `Unix.select` event loop; client
+  output is nonblocking and bounded, but a blocking upstream reconnect attempt
+  can still delay other clients
+- connection, output-buffer, and approximate memory limits are configurable
+  with `--maxclients` (default 1024), `--max-output-buffer` (default 64 MiB),
+  and `--maxmemory` (default 256 MiB, `0` disables it); memory policy is
+  `noeviction`
 - keys expire lazily on access; there is no active expiry cycle
 - RDB checksums are not verified, and unsupported RDB value types fail startup
-- full resync does not import the master's existing dataset; a non-empty RDB
-  payload is discarded with a warning
-- the replica does not reconnect after the link drops, and partial resync is
-  not implemented
+- this server's full resync still sends an empty RDB; it does not serialize its
+  own dataset for first-time replicas
+- a replica importing from another master accepts supported string RDB values
+  and fails sync on unsupported value types
+- the replica reconnects after a link drop and uses a 4 MiB master backlog for
+  partial resync; a longer gap falls back to full resync
 - `--requirepass` and `--masterauth` appear in the process argument list
 - inline commands, `SELECT`, `QUIT`, RESP3, Lua, AOF, cluster mode, and pattern
   Pub/Sub are not implemented
+- TLS handshakes time out after ten seconds
 
 The authentication path was hardened in the audit: `PSYNC` is no longer
 pre-auth, password comparison is constant-time over SHA-256 digests,
@@ -856,6 +901,7 @@ lib/
   command.*            typed command parsing and re-encoding
   store.*              in-memory data-family semantics
   engine.*             command execution semantics
+  tls_transport.*     nonblocking TLS record and handshake transport
   server.*             event loop, clients, blocking, replication, auth, pubsub
   rdb.*                startup RDB loading subset
   redis.*              public library aggregation
@@ -880,6 +926,10 @@ Runtime/build baseline:
 - OCaml stdlib
 - `unix`
 - `dune`
+- `tls` and `x509` for the optional TLS transport
+
+The TLS dependency is justified by the security requirement. Everything else
+remains in the standard library.
 
 Any additional dependency should be justified by correctness, deterministic testing, or a substantial reduction in protocol/networking risk.
 

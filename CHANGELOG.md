@@ -45,6 +45,16 @@ The format is inspired by Keep a Changelog, adapted for this learning-project re
 
 ### Added
 - `SET ... EXAT|PXAT`, `LPOP`, and the `--masterauth` option.
+- Optional client-facing TLS with `--tls-cert` and `--tls-key`, driven by a pure
+  nonblocking TLS record engine so the event loop keeps its output queues.
+- `--maxclients`, `--max-output-buffer`, and `--maxmemory` limits, plus
+  `INFO memory` and `noeviction` enforcement.
+- Replica reconnect with partial resync (`PSYNC` continuation and a 4 MiB
+  master backlog), import of non-empty full-resync RDB payloads, and
+  MULTI/EXEC transaction propagation so replicas apply transactions atomically.
+- Nonblocking client and upstream output queues, with `--maxclients`,
+  `--max-output-buffer`, and `--maxmemory` enforcement plus `INFO memory`.
+- Client-facing TLS with a handshake deadline and close notifications.
 - `lib/integer.ml` for strict decimal parsing and `lib/sha256.ml` for ACL
   digests.
 - `docs/AUDIT.md`, including a residual-risk register.

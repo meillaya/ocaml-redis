@@ -8,6 +8,9 @@
   packages = [
     pkgs.dune_3
     pkgs.ocamlPackages.ocamlformat
+    pkgs.ocamlPackages.tls
+    pkgs.ocamlPackages.x509
+    pkgs.openssl
     pkgs.redis
     pkgs.jq
   ];
@@ -18,7 +21,7 @@
 
   scripts.tests.exec = "dune test --display=short";
 
-  scripts.fmt.exec = "dune build @fmt --auto-promote";
+  scripts.fmt.exec = "dune build @fmt --auto-promote || true";
 
   scripts.fmt-check.exec = "dune build @fmt";
 

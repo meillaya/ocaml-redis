@@ -47,9 +47,12 @@ The most serious issues were:
 6. `ACL GETUSER` returned the configured password in cleartext, and `AUTH`
    compared passwords with an early-exit string comparison.
 
-All six are fixed and tested. The remaining risk is concentrated in deliberate
-scope: this is still a loopback-bound, single-user, single-threaded learning
-server without TLS, output buffering, memory limits, or full-resync import.
+All six are fixed and tested. A follow-up hardening pass then added bounded
+nonblocking output queues, connection and memory limits, client-facing TLS,
+full-resync RDB import, replica reconnect with partial resync, and atomic
+transaction propagation. The remaining risk is concentrated in deliberate
+scope, mainly single-process operation and the unsupported parts of the Redis
+surface.
 
 ## Findings and disposition
 
@@ -78,7 +81,7 @@ deployment.
 | H7 | `ACL GETUSER default` returned the cleartext `requirepass`, unlike Redis. `AUTH` used `=` on strings, short-circuiting at the first differing byte. | `lib/server.ml` old ACL/auth helpers | Fixed: a local SHA-256 implementation reports the digest Redis reports, and password checks compare fixed-width digests in constant time. Tests: `auth and acl subset works`, plus the strict test lane. |
 | H8 | `INCR` wrapped at `Int64.max_int`, and integer arguments accepted OCaml forms Redis rejects (`0x10`, `+1`, `1_000`). A stored `0x10` incremented to 17. | `lib/store.ml`, `lib/command.ml` | Fixed: strict decimal parser (`lib/integer.ml`) used at every wire boundary, plus a checked overflow error. Tests: `strict integer and expiry edge cases`, `engine reports INCR overflow`. |
 | H9 | `WAIT` narrowed `int64` replica counts to `int`; values above `max_int` wrapped negative and could satisfy the wait immediately. | `Int64.to_int required_replicas` | Fixed: all comparisons stay in `int64`. Covered by `WAIT` regression tests and code review. |
-| H10 | RDB loading read the whole file without a size check, and non-empty full-resync payloads were discarded silently, leaving an operator believing a replica had imported data. | `lib/rdb.ml`, `read_rdb_payload_blocking` | Mitigated: 256 MiB file cap and a stderr warning with the discarded byte count. Import remains unimplemented and is documented as a deliberate limitation. |
+| H10 | RDB loading read the whole file without a size check, and non-empty full-resync payloads were discarded silently, leaving an operator believing a replica had imported data. | `lib/rdb.ml`, `read_rdb_payload_blocking` | Fixed in the follow-up pass: 256 MiB file cap plus in-memory RDB parsing and import. Unsupported value types fail the sync instead of being discarded. This master's own resync payload remains empty. |
 
 ### Medium
 
@@ -110,6 +113,25 @@ deployment.
 - Error wording remains close to, but not byte-identical with, Redis in several
   edges. The compatibility matrix marks these areas as partial subsets.
 
+## Follow-up hardening pass
+
+The second pass added these controls and guarantees:
+
+- **Nonblocking output**: every client has a bounded output buffer, flush events
+  are driven by `select`, and `maxclients`, `max-output-buffer`, and `maxmemory`
+  are configurable. `INFO memory` reports usage and policy.
+- **RDB import**: non-empty full-resync payloads are parsed and loaded, the
+  replica store is cleared first, and unsupported RDB value types fail the sync
+  instead of silently discarding data.
+- **Reconnect and partial resync**: the master keeps a 4 MiB backlog and answers
+  a matching `PSYNC` with `+CONTINUE`; the replica reconnects every second and
+  preserves its offset and replid.
+- **Transaction atomicity**: `EXEC` writes are wrapped in `MULTI`/`EXEC` on the
+  wire; the replica queues them and applies the whole batch before waking local
+  readers.
+- **TLS**: `--tls-cert`/`--tls-key` enable a pure, nonblocking TLS engine for
+  client connections. Ciphertext uses the same bounded output queue as plaintext.
+
 ## Verification performed
 
 ```sh
@@ -122,6 +144,8 @@ OCAML_REDIS_LIVE=1 dune exec test/test_main.exe
 
 The opt-in live lane also passed against Redis 8.10.2, including Pub/Sub wire
 shapes, transaction/geo reply shapes, and the replica-interoperability probe.
+The deterministic lane also covers a TLS handshake and encrypted RESP round
+trips using a generated self-signed certificate.
 
 The deterministic suite now includes regression tests for:
 
@@ -137,6 +161,10 @@ The deterministic suite now includes regression tests for:
 - case-insensitive subcommands and keywords
 - `PUBLISH`/`INFO` inside `MULTI`
 - `PSYNC`/`REPLCONF` authentication gates and SHA-256 ACL digests
+- `maxclients`, output-buffer, and `maxmemory` enforcement
+- non-empty full-resync import, reconnect, and `+CONTINUE` partial resync
+- replica transaction isolation and master-side `MULTI`/`EXEC` propagation
+- TLS handshake and encrypted RESP round trips
 
 ## Residual risk register
 
@@ -144,13 +172,14 @@ These are accepted for the current learning scope, not silently ignored.
 
 | Risk | Impact | Why it remains |
 |---|---|---|
-| One event loop with blocking writes | A slow reader delays every other client; a large reply can stall the server | Fixing it properly needs per-client non-blocking output buffers and backpressure |
-| No TLS, loopback-only bind | Credentials and data are not protected if the bind is changed or the host is shared | Documented; deployment hardening is out of scope |
-| No connection, output-buffer, or memory limits | Resource exhaustion remains possible within the 128 MiB input cap | Requires policy and configuration surface (`maxmemory`, client limits) |
-| Full-resync RDB is not imported | A replica starts empty and only converges on post-connect writes | RDB import is a substantial feature; now fails loudly with a warning instead of silently |
-| No reconnect or partial resync | A dropped upstream link stays down; the replica does not recover automatically | Needs a supervisor loop and backlog maintenance |
+| Single event loop | A blocking upstream reconnect attempt can still delay other clients | Output writes are nonblocking and bounded; reconnect attempts are not fully offloaded |
+| TLS is client-facing only | Replication upstream links remain plaintext, and clients are not certificate-authenticated | Server-side TLS is implemented; mutual TLS and upstream TLS are future work |
+| Loopback-only bind | Remote clients cannot connect without a proxy | Deliberate safety default; `--bind` is not implemented |
+| `maxmemory` is approximate and noeviction | One write can cross the ceiling before later writes are rejected; eviction is unavailable | Accounting ignores allocator overhead by design; eviction is a larger policy feature |
+| This master still sends an empty full-resync RDB | A replica that first connects to this server does not receive pre-existing local data | The replica imports non-empty RDBs from other masters; serializing this store back to RDB is future work |
+| Reconnect uses a 4 MiB backlog | A longer disconnect falls back to full resync, which is empty from this master | Backlog sizing and RDB serialization are future work |
+| TLS handshake deadline | Incomplete handshakes are closed after ten seconds | The deadline bounds slowloris-style handshakes; CPU cost per handshake is not accounted separately |
 | No cascading replication | A replica cannot serve downstream replicas | Out of the current replication model |
-| Transaction atomicity on replicas | A replica can observe an intermediate state from a propagated `EXEC` | Writes are propagated individually; wrapping them in a replica-side transaction is future work |
 | No active expiry cycle | Expired keys occupy memory until accessed | Redis uses active plus lazy expiry; this subset uses lazy only |
 | Wall-clock timeouts | A system clock jump can change blocking timeouts | Expiry needs wall time; separating a monotonic timeout clock is future work |
 | RDB checksum not verified | Corrupt RDB payloads may load partially | CRC64 verification is not implemented |

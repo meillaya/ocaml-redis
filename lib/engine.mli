@@ -14,6 +14,8 @@ type outcome = {
 type t
 
 val create : unit -> t
+val memory_usage : t -> int64
+val clear : t -> unit
 
 val load_string :
   t -> key:string -> value:string -> expires_at_ms:int64 option -> unit
