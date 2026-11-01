@@ -18,7 +18,7 @@ let create_cursor data =
 let remaining cursor = cursor.len - cursor.pos
 
 let read_exact cursor n =
-  if remaining cursor < n then None
+  if n < 0 || remaining cursor < n then None
   else
     let value = Bytes.sub_string cursor.data cursor.pos n in
     cursor.pos <- cursor.pos + n;
@@ -107,7 +107,8 @@ let read_string cursor =
   | None -> failf "unexpected EOF while reading string length"
   | Some (Plain_len len) -> (
       match int64_to_int_opt len with
-      | None -> failf "string length too large: %Ld" len
+      | None -> failf "string length out of range: %Ld" len
+      | Some len when len < 0 -> failf "negative string length: %d" len
       | Some len -> (
           match read_exact cursor len with
           | Some value -> Ok value
@@ -159,66 +160,80 @@ let read_version header =
     | Some version -> Ok version
     | None -> failf "invalid RDB version"
 
+let max_file_size = 256 * 1024 * 1024
+
 let load_file path =
   try
-    let data =
-      Stdlib.In_channel.with_open_bin path Stdlib.In_channel.input_all
-    in
-    let cursor = create_cursor data in
-    match read_exact cursor 9 with
-    | None -> failf "RDB file is too short"
-    | Some header -> (
-        match read_version header with
-        | Error _ as error -> error
-        | Ok version ->
-            let rec loop current_db pending_expiry acc =
-              match read_byte cursor with
-              | None -> failf "unexpected EOF before RDB EOF opcode"
-              | Some 255 ->
-                  if remaining cursor >= 8 then ignore (read_exact cursor 8);
-                  Ok (List.rev acc)
-              | Some 250 -> (
-                  match (read_string cursor, read_string cursor) with
-                  | Ok _, Ok _ -> loop current_db pending_expiry acc
-                  | (Error _ as error), _ -> error
-                  | _, (Error _ as error) -> error)
-              | Some 251 -> (
-                  match (read_len cursor, read_len cursor) with
-                  | Some _, Some _ -> loop current_db pending_expiry acc
-                  | _ -> failf "unexpected EOF in RESIZEDB payload")
-              | Some 252 -> (
-                  match read_u64_le cursor with
-                  | Some expires_at_ms ->
-                      loop current_db (Some expires_at_ms) acc
-                  | None -> failf "unexpected EOF in EXPIRETIME_MS payload")
-              | Some 253 -> (
-                  match read_u32_le cursor with
-                  | Some expires_at_s ->
-                      loop current_db (Some Int64.(mul expires_at_s 1000L)) acc
-                  | None -> failf "unexpected EOF in EXPIRETIME payload")
-              | Some 254 -> (
-                  match read_len cursor with
-                  | Some (Plain_len db) -> (
-                      match int64_to_int_opt db with
-                      | Some db -> loop db pending_expiry acc
-                      | None -> failf "database index too large: %Ld" db)
-                  | Some (Encoded _) ->
-                      failf "encoded SELECTDB length is not supported"
-                  | None -> failf "unexpected EOF in SELECTDB payload")
-              | Some 0 -> (
-                  match (read_string cursor, read_string cursor) with
-                  | Ok key, Ok value ->
-                      let acc =
-                        if current_db = 0 then
-                          { key; value; expires_at_ms = pending_expiry } :: acc
-                        else acc
-                      in
-                      loop current_db None acc
-                  | (Error _ as error), _ -> error
-                  | _, (Error _ as error) -> error)
-              | Some opcode ->
-                  failf "unsupported RDB opcode/type: %d (version %d)" opcode
-                    version
-            in
-            loop 0 None [])
-  with Sys_error message -> Error message
+    let stats = Unix.stat path in
+    if stats.Unix.st_size > max_file_size then
+      failf "RDB file is larger than the supported %d-byte limit" max_file_size
+    else
+      let data =
+        Stdlib.In_channel.with_open_bin path Stdlib.In_channel.input_all
+      in
+      let cursor = create_cursor data in
+      match read_exact cursor 9 with
+      | None -> failf "RDB file is too short"
+      | Some header -> (
+          match read_version header with
+          | Error _ as error -> error
+          | Ok version ->
+              let rec loop current_db pending_expiry acc =
+                match read_byte cursor with
+                | None -> failf "unexpected EOF before RDB EOF opcode"
+                | Some 255 ->
+                    if remaining cursor >= 8 then ignore (read_exact cursor 8);
+                    Ok (List.rev acc)
+                | Some 250 -> (
+                    match (read_string cursor, read_string cursor) with
+                    | Ok _, Ok _ -> loop current_db pending_expiry acc
+                    | (Error _ as error), _ -> error
+                    | _, (Error _ as error) -> error)
+                | Some 251 -> (
+                    match (read_len cursor, read_len cursor) with
+                    | Some _, Some _ -> loop current_db pending_expiry acc
+                    | _ -> failf "unexpected EOF in RESIZEDB payload")
+                | Some 252 -> (
+                    match read_u64_le cursor with
+                    | Some expires_at_ms ->
+                        loop current_db (Some expires_at_ms) acc
+                    | None -> failf "unexpected EOF in EXPIRETIME_MS payload")
+                | Some 253 -> (
+                    match read_u32_le cursor with
+                    | Some expires_at_s ->
+                        loop current_db
+                          (Some Int64.(mul expires_at_s 1000L))
+                          acc
+                    | None -> failf "unexpected EOF in EXPIRETIME payload")
+                | Some 254 -> (
+                    match read_len cursor with
+                    | Some (Plain_len db) -> (
+                        match int64_to_int_opt db with
+                        | Some db -> loop db pending_expiry acc
+                        | None -> failf "database index too large: %Ld" db)
+                    | Some (Encoded _) ->
+                        failf "encoded SELECTDB length is not supported"
+                    | None -> failf "unexpected EOF in SELECTDB payload")
+                | Some 0 -> (
+                    match (read_string cursor, read_string cursor) with
+                    | Ok key, Ok value ->
+                        let acc =
+                          if current_db = 0 then
+                            { key; value; expires_at_ms = pending_expiry }
+                            :: acc
+                          else acc
+                        in
+                        loop current_db None acc
+                    | (Error _ as error), _ -> error
+                    | _, (Error _ as error) -> error)
+                | Some opcode ->
+                    failf "unsupported RDB opcode/type: %d (version %d)" opcode
+                      version
+              in
+              loop 0 None [])
+  with
+  | Sys_error message -> Error message
+  | Unix.Unix_error (error, operation, argument) ->
+      Error
+        (Printf.sprintf "%s %S: %s" operation argument
+           (Unix.error_message error))

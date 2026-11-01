@@ -1,9 +1,13 @@
 type t
 type wrong_type = [ `Wrong_type ]
-type incr_error = [ wrong_type | `Not_an_integer ]
+type incr_error = [ wrong_type | `Not_an_integer | `Overflow ]
 type 'a lookup = [ `Missing | `Value of 'a | wrong_type ]
 type key_type = [ `None | `String | `List | `Stream | `Zset ]
 type geo_lookup = (float * float) option
+
+type geosearch_error =
+  [ wrong_type | `Invalid_center of float * float | `Invalid_radius of float ]
+
 type stream_id
 type stream_entry = { id : stream_id; fields : (string * string) list }
 
@@ -111,7 +115,7 @@ val geosearch :
   longitude:float ->
   latitude:float ->
   radius_meters:float ->
-  (string list, wrong_type) result
+  (string list, geosearch_error) result
 
 val stream_id_to_string : stream_id -> string
 

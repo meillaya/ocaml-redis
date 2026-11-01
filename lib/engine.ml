@@ -25,6 +25,7 @@ let wrong_type_message =
   "Operation against a key holding the wrong kind of value"
 
 let not_integer_message = "value is not an integer or out of range"
+let overflow_message = "increment or decrement would overflow"
 
 let stream_id_not_greater_message =
   "The ID specified in XADD is equal or smaller than the target stream top item"
@@ -69,7 +70,11 @@ let encode_geopos = function
           Resp.Bulk_string (Some (score_to_string latitude));
         ]
 
-let unit_multiplier = function "m" -> Some 1. | "km" -> Some 0.001 | _ -> None
+let unit_multiplier unit =
+  match String.lowercase_ascii unit with
+  | "m" -> Some 1.
+  | "km" -> Some 0.001
+  | _ -> None
 
 let encode_stream_entry entry =
   Resp.Array
@@ -152,8 +157,14 @@ let handle ~now_ms state = function
           immediate
             (Resp.Prefixed_error
                { prefix = "WRONGTYPE"; message = wrong_type_message }))
-  | Set { key; value; expiry_ms } ->
-      let expires_at_ms = Option.map (Int64.add now_ms) expiry_ms in
+  | Set { key; value; expiry } ->
+      let expires_at_ms =
+        match expiry with
+        | None -> None
+        | Some (Command.Relative_ms relative_ms) ->
+            Some (Expiry.add_saturating now_ms relative_ms)
+        | Some (Command.Absolute_ms expires_at_ms) -> Some expires_at_ms
+      in
       Store.set_string state.store ~key ~value ~expires_at_ms;
       immediate (Resp.Simple_string "OK")
   | Incr key -> (
@@ -163,7 +174,8 @@ let handle ~now_ms state = function
           immediate
             (Resp.Prefixed_error
                { prefix = "WRONGTYPE"; message = wrong_type_message })
-      | Error `Not_an_integer -> immediate (Resp.Error not_integer_message))
+      | Error `Not_an_integer -> immediate (Resp.Error not_integer_message)
+      | Error `Overflow -> immediate (Resp.Error overflow_message))
   | Rpush { key; values } -> (
       match Store.rpush ~now_ms state.store ~key values with
       | Ok length -> immediate ~wake_keys:[ key ] (Resp.Integer length)
@@ -198,6 +210,14 @@ let handle ~now_ms state = function
   | Lrem { key; count; element } -> (
       match Store.lrem ~now_ms state.store ~key count element with
       | Ok removed -> immediate (Resp.Integer removed)
+      | Error `Wrong_type ->
+          immediate
+            (Resp.Prefixed_error
+               { prefix = "WRONGTYPE"; message = wrong_type_message }))
+  | Lpop key -> (
+      match Store.lpop ~now_ms state.store ~key with
+      | Ok (Some value) -> immediate (Resp.Bulk_string (Some value))
+      | Ok None -> immediate (Resp.Bulk_string None)
       | Error `Wrong_type ->
           immediate
             (Resp.Prefixed_error
@@ -303,7 +323,14 @@ let handle ~now_ms state = function
           | Error `Wrong_type ->
               immediate
                 (Resp.Prefixed_error
-                   { prefix = "WRONGTYPE"; message = wrong_type_message })))
+                   { prefix = "WRONGTYPE"; message = wrong_type_message })
+          | Error (`Invalid_center (longitude, latitude)) ->
+              immediate
+                (Resp.Error
+                   (Printf.sprintf "invalid longitude,latitude pair %f,%f"
+                      longitude latitude))
+          | Error (`Invalid_radius _) ->
+              immediate (Resp.Error "radius cannot be negative")))
   | Blpop { key; timeout_ms } -> (
       match Store.lpop ~now_ms state.store ~key with
       | Ok (Some value) ->

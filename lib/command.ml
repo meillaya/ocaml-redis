@@ -1,15 +1,18 @@
+type set_expiry = Relative_ms of int64 | Absolute_ms of int64
+
 type t =
   | Ping of string option
   | Echo of string
   | Info of string option
   | Type of string
   | Get of string
-  | Set of { key : string; value : string; expiry_ms : int64 option }
+  | Set of { key : string; value : string; expiry : set_expiry option }
   | Rpush of { key : string; values : string list }
   | Lpush of { key : string; values : string list }
   | Lrange of { key : string; start_index : int64; stop_index : int64 }
   | Llen of string
   | Lrem of { key : string; count : int64; element : string }
+  | Lpop of string
   | Blpop of { key : string; timeout_ms : int64 option }
   | Incr of string
   | Multi
@@ -63,38 +66,76 @@ type error =
 let wrong_arity command = Wrong_arity command
 
 let parse_int64 value =
-  match Int64.of_string_opt value with
+  match Integer.of_string_opt value with
   | Some parsed -> Ok parsed
   | None -> Error (Invalid_integer value)
 
+let valid_float_syntax value =
+  let length = String.length value in
+  let index = ref 0 in
+  if !index < length && (value.[!index] = '+' || value.[!index] = '-') then
+    incr index;
+  let consume_digits () =
+    let start = !index in
+    while !index < length && value.[!index] >= '0' && value.[!index] <= '9' do
+      incr index
+    done;
+    !index - start
+  in
+  let before = consume_digits () in
+  let after =
+    if !index < length && value.[!index] = '.' then (
+      incr index;
+      consume_digits ())
+    else 0
+  in
+  if before = 0 && after = 0 then false
+  else (
+    if !index < length && (value.[!index] = 'e' || value.[!index] = 'E') then (
+      incr index;
+      if !index < length && (value.[!index] = '+' || value.[!index] = '-') then
+        incr index;
+      if consume_digits () = 0 then index := length + 1);
+    !index = length)
+
 let parse_float value =
-  match float_of_string_opt value with
-  | Some parsed
-    when classify_float parsed <> FP_nan && classify_float parsed <> FP_infinite
+  if not (valid_float_syntax value) then Error (Invalid_float value)
+  else
+    match float_of_string_opt value with
+    | Some parsed
+      when classify_float parsed <> FP_nan
+           && classify_float parsed <> FP_infinite ->
+        Ok parsed
+    | _ -> Error (Invalid_float value)
+
+let parse_bounded_expiry multiplier constructor raw =
+  match Integer.of_string_opt raw with
+  | None -> Error (Invalid_integer raw)
+  | Some value when value <= 0L -> Error (Invalid_expiry raw)
+  | Some value when Int64.compare value (Int64.div Int64.max_int multiplier) > 0
     ->
-      Ok parsed
-  | _ -> Error (Invalid_float value)
+      Error (Invalid_expiry raw)
+  | Some value -> Ok (constructor (Int64.mul value multiplier))
 
 let parse_set arguments =
   match arguments with
-  | [ key; value ] -> Ok (Set { key; value; expiry_ms = None })
+  | [ key; value ] -> Ok (Set { key; value; expiry = None })
   | [ key; value; option_name; option_value ] ->
-      let option_name = String.uppercase_ascii option_name in
-      let parse_expiry multiplier =
-        match Int64.of_string_opt option_value with
-        | None -> Error (Invalid_integer option_value)
-        | Some value when value <= 0L -> Error (Invalid_expiry option_value)
-        | Some value -> Ok (Int64.mul value multiplier)
+      let parse_relative multiplier raw =
+        parse_bounded_expiry multiplier (fun expiry -> Relative_ms expiry) raw
+      in
+      let parse_absolute multiplier raw =
+        parse_bounded_expiry multiplier (fun expiry -> Absolute_ms expiry) raw
       in
       let result =
-        match option_name with
-        | "EX" -> parse_expiry 1000L
-        | "PX" -> parse_expiry 1L
+        match String.uppercase_ascii option_name with
+        | "EX" -> parse_relative 1000L option_value
+        | "PX" -> parse_relative 1L option_value
+        | "EXAT" -> parse_absolute 1000L option_value
+        | "PXAT" -> parse_absolute 1L option_value
         | _ -> Error (Syntax_error "unsupported SET option")
       in
-      Result.map
-        (fun expiry_ms -> Set { key; value; expiry_ms = Some expiry_ms })
-        result
+      Result.map (fun expiry -> Set { key; value; expiry = Some expiry }) result
   | _ -> Error (wrong_arity "set")
 
 let parse_nonempty_values constructor command_name = function
@@ -125,6 +166,9 @@ let parse_blpop = function
       | Error _ as error -> error
       | Ok seconds when seconds < 0L -> Error (Invalid_timeout timeout)
       | Ok 0L -> Ok (Blpop { key; timeout_ms = None })
+      | Ok seconds
+        when Int64.compare seconds (Int64.div Int64.max_int 1000L) > 0 ->
+          Error (Invalid_timeout timeout)
       | Ok seconds ->
           Ok (Blpop { key; timeout_ms = Some (Int64.mul seconds 1000L) }))
   | _ -> Error (wrong_arity "blpop")
@@ -224,7 +268,9 @@ let parse_geodist = function
   | _ -> Error (wrong_arity "geodist")
 
 let parse_geosearch = function
-  | [ key; "FROMLONLAT"; lon_raw; lat_raw; "BYRADIUS"; radius_raw; unit ] ->
+  | [ key; from; lon_raw; lat_raw; by; radius_raw; unit ]
+    when String.uppercase_ascii from = "FROMLONLAT"
+         && String.uppercase_ascii by = "BYRADIUS" ->
       Result.bind (parse_float lon_raw) (fun longitude ->
           Result.bind (parse_float lat_raw) (fun latitude ->
               Result.map
@@ -239,13 +285,15 @@ let parse_xrange = function
 
 let parse_xread arguments =
   let rec parse_options block_ms = function
-    | "BLOCK" :: timeout_raw :: rest -> (
+    | token :: timeout_raw :: rest when String.uppercase_ascii token = "BLOCK"
+      -> (
         match parse_int64 timeout_raw with
         | Error _ as error -> error
         | Ok timeout when timeout < 0L -> Error (Invalid_timeout timeout_raw)
         | Ok 0L -> parse_options (Some (-1L)) rest
         | Ok timeout -> parse_options (Some timeout) rest)
-    | "STREAMS" :: rest -> Ok (block_ms, rest)
+    | token :: rest when String.uppercase_ascii token = "STREAMS" ->
+        Ok (block_ms, rest)
     | _ -> Error (Syntax_error "expected STREAMS in XREAD")
   in
   match parse_options None arguments with
@@ -297,8 +345,10 @@ let parse_auth = function
   | _ -> Error (wrong_arity "auth")
 
 let parse_acl = function
-  | [ "WHOAMI" ] -> Ok AclWhoami
-  | [ "GETUSER"; user ] -> Ok (AclGetuser user)
+  | [ subcommand ] when String.uppercase_ascii subcommand = "WHOAMI" ->
+      Ok AclWhoami
+  | [ subcommand; user ] when String.uppercase_ascii subcommand = "GETUSER" ->
+      Ok (AclGetuser user)
   | _ -> Error (wrong_arity "acl")
 
 let parse arguments =
@@ -325,6 +375,7 @@ let parse arguments =
       | "LRANGE", rest -> parse_range rest
       | "LLEN", [ key ] -> Ok (Llen key)
       | "LREM", rest -> parse_lrem rest
+      | "LPOP", [ key ] -> Ok (Lpop key)
       | "BLPOP", rest -> parse_blpop rest
       | "INCR", [ key ] -> Ok (Incr key)
       | "MULTI", rest -> parse_no_args "multi" Multi rest
@@ -359,23 +410,33 @@ let parse arguments =
       | "TYPE", _ -> Error (wrong_arity "type")
       | "GET", _ -> Error (wrong_arity "get")
       | "LLEN", _ -> Error (wrong_arity "llen")
+      | "LPOP", _ -> Error (wrong_arity "lpop")
       | "INCR", _ -> Error (wrong_arity "incr")
       | "PUBLISH", _ -> Error (wrong_arity "publish")
       | "ZCARD", _ -> Error (wrong_arity "zcard")
       | _ -> Error (Unknown_command command_name))
 
+let describe_value value =
+  let maximum = 64 in
+  if String.length value <= maximum then value
+  else String.sub value 0 maximum ^ "..."
+
 let to_error_message = function
-  | Unknown_command command -> Printf.sprintf "unknown command '%s'" command
+  | Unknown_command command ->
+      Printf.sprintf "unknown command '%s'" (describe_value command)
   | Wrong_arity command ->
-      Printf.sprintf "wrong number of arguments for '%s' command" command
+      Printf.sprintf "wrong number of arguments for '%s' command"
+        (describe_value command)
   | Syntax_error message -> Printf.sprintf "syntax error: %s" message
   | Invalid_integer value ->
-      Printf.sprintf "value is not an integer or out of range: %s" value
+      Printf.sprintf "value is not an integer or out of range: %s"
+        (describe_value value)
   | Invalid_expiry value ->
-      Printf.sprintf "invalid expire time in command: %s" value
+      Printf.sprintf "invalid expire time in command: %s" (describe_value value)
   | Invalid_timeout value ->
-      Printf.sprintf "invalid timeout in command: %s" value
-  | Invalid_float value -> Printf.sprintf "value is not a valid float: %s" value
+      Printf.sprintf "invalid timeout in command: %s" (describe_value value)
+  | Invalid_float value ->
+      Printf.sprintf "value is not a valid float: %s" (describe_value value)
 
 let format_score score =
   let fractional, _ = modf score in
@@ -390,9 +451,11 @@ let to_arguments = function
   | Info (Some section) -> Some [ "INFO"; section ]
   | Type key -> Some [ "TYPE"; key ]
   | Get key -> Some [ "GET"; key ]
-  | Set { key; value; expiry_ms = None } -> Some [ "SET"; key; value ]
-  | Set { key; value; expiry_ms = Some expiry_ms } ->
+  | Set { key; value; expiry = None } -> Some [ "SET"; key; value ]
+  | Set { key; value; expiry = Some (Relative_ms expiry_ms) } ->
       Some [ "SET"; key; value; "PX"; Int64.to_string expiry_ms ]
+  | Set { key; value; expiry = Some (Absolute_ms expires_at_ms) } ->
+      Some [ "SET"; key; value; "PXAT"; Int64.to_string expires_at_ms ]
   | Rpush { key; values } -> Some ("RPUSH" :: key :: values)
   | Lpush { key; values } -> Some ("LPUSH" :: key :: values)
   | Lrange { key; start_index; stop_index } ->
@@ -403,6 +466,7 @@ let to_arguments = function
   | Llen key -> Some [ "LLEN"; key ]
   | Lrem { key; count; element } ->
       Some [ "LREM"; key; Int64.to_string count; element ]
+  | Lpop key -> Some [ "LPOP"; key ]
   | Blpop { key; timeout_ms = None } -> Some [ "BLPOP"; key; "0" ]
   | Blpop { key; timeout_ms = Some timeout_ms } ->
       Some [ "BLPOP"; key; Int64.to_string (Int64.div timeout_ms 1000L) ]
@@ -480,7 +544,7 @@ let to_arguments = function
       Some (block_part @ [ "STREAMS" ] @ keys @ ids)
 
 let is_write = function
-  | Set _ | Rpush _ | Lpush _ | Lrem _ | Blpop _ | Incr _ | Zadd _ | Zrem _
-  | Geoadd _ | Xadd _ ->
+  | Set _ | Rpush _ | Lpush _ | Lrem _ | Lpop _ | Blpop _ | Incr _ | Zadd _
+  | Zrem _ | Geoadd _ | Xadd _ ->
       true
   | _ -> false

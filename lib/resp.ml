@@ -13,11 +13,31 @@ type frame =
   | Bulk_string_frame of string option
   | Command_frame of string list
 
+(* Redis limits protocol elements too. These ceilings keep a claimed length
+   from overflowing [int] arithmetic or forcing an unbounded allocation before
+   the payload has arrived. They are deliberately generous for a learning
+   server: 64 MiB per bulk string and one million arguments per request. *)
+let max_bulk_string_length = 64 * 1024 * 1024
+let max_array_length = 1_048_576
+
+let sanitize_error_message message =
+  let maximum = 512 in
+  let length = String.length message in
+  let kept = min length maximum in
+  let buffer = Buffer.create (kept + 3) in
+  for index = 0 to kept - 1 do
+    match message.[index] with
+    | '\r' | '\n' -> Buffer.add_char buffer ' '
+    | character -> Buffer.add_char buffer character
+  done;
+  if length > kept then Buffer.add_string buffer "...";
+  Buffer.contents buffer
+
 let rec encode_reply = function
   | Simple_string value -> "+" ^ value ^ "\r\n"
-  | Error message -> "-ERR " ^ message ^ "\r\n"
+  | Error message -> "-ERR " ^ sanitize_error_message message ^ "\r\n"
   | Prefixed_error { prefix; message } ->
-      Printf.sprintf "-%s %s\r\n" prefix message
+      Printf.sprintf "-%s %s\r\n" prefix (sanitize_error_message message)
   | Integer value -> ":" ^ Int64.to_string value ^ "\r\n"
   | Bulk_string None -> "$-1\r\n"
   | Bulk_string (Some value) ->
@@ -41,11 +61,15 @@ let find_crlf input ~start =
   in
   loop start
 
+let describe value =
+  if String.length value <= 64 then value else String.sub value 0 64 ^ "..."
+
 let parse_decimal_int label value =
-  match int_of_string_opt value with
+  match Integer.to_int_opt value with
   | Some parsed -> Stdlib.Ok parsed
   | None ->
-      Stdlib.Error (Printf.sprintf "protocol error: invalid %s %S" label value)
+      Stdlib.Error
+        (Printf.sprintf "protocol error: invalid %s %S" label (describe value))
 
 let parse_line input ~start =
   match find_crlf input ~start with
@@ -61,7 +85,11 @@ let parse_bulk_string input ~start =
       Some
         (match parse_decimal_int "bulk length" length_line with
         | Stdlib.Error _ as error -> error
-        | Stdlib.Ok length when length < 0 -> Stdlib.Ok (None, after_length)
+        | Stdlib.Ok -1 -> Stdlib.Ok (None, after_length)
+        | Stdlib.Ok length when length < -1 ->
+            Stdlib.Error "protocol error: invalid negative bulk length"
+        | Stdlib.Ok length when length > max_bulk_string_length ->
+            Stdlib.Error "protocol error: bulk string length exceeds limit"
         | Stdlib.Ok length ->
             let needed = after_length + length + 2 in
             if String.length input < needed then raise Exit
@@ -87,6 +115,8 @@ let parse_request input =
           | Stdlib.Error _ as error -> error
           | Stdlib.Ok arity when arity < 0 ->
               Stdlib.Error "protocol error: negative array length"
+          | Stdlib.Ok arity when arity > max_array_length ->
+              Stdlib.Error "protocol error: array length exceeds limit"
           | Stdlib.Ok arity ->
               let rec consume count cursor acc =
                 if count = 0 then Stdlib.Ok (List.rev acc, cursor)

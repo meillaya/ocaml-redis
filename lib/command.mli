@@ -1,15 +1,18 @@
+type set_expiry = Relative_ms of int64 | Absolute_ms of int64
+
 type t =
   | Ping of string option
   | Echo of string
   | Info of string option
   | Type of string
   | Get of string
-  | Set of { key : string; value : string; expiry_ms : int64 option }
+  | Set of { key : string; value : string; expiry : set_expiry option }
   | Rpush of { key : string; values : string list }
   | Lpush of { key : string; values : string list }
   | Lrange of { key : string; start_index : int64; stop_index : int64 }
   | Llen of string
   | Lrem of { key : string; count : int64; element : string }
+  | Lpop of string
   | Blpop of { key : string; timeout_ms : int64 option }
   | Incr of string
   | Multi

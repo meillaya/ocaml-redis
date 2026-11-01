@@ -1,2 +1,6 @@
 _build/
 .omx/
+.direnv/
+.devenv/
+result
+_opam/

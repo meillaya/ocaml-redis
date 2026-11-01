@@ -108,7 +108,7 @@ let assert_some_int64_equal value ~expected ~context =
   | Some actual -> assert_int64_equal ~expected ~actual ~context
   | None -> fail (context ^ ": expected Some value")
 
-let with_server ?replicaof ?rdb_file ?requirepass test_fn =
+let with_server_process ?replicaof ?rdb_file ?requirepass ?masterauth test_fn =
   let discover_port () =
     let rec loop () =
       let port = !next_test_port in
@@ -133,7 +133,9 @@ let with_server ?replicaof ?rdb_file ?requirepass test_fn =
       match
         Unix.connect fd (Unix.ADDR_INET (Unix.inet_addr_loopback, port))
       with
-      | () -> fd
+      | () ->
+          Unix.setsockopt_float fd Unix.SO_RCVTIMEO 15.0;
+          fd
       | exception Unix.Unix_error _ ->
           Unix.close fd;
           if Unix.gettimeofday () >= deadline then
@@ -163,7 +165,12 @@ let with_server ?replicaof ?rdb_file ?requirepass test_fn =
       | None -> with_rdb
       | Some password -> with_rdb @ [ "--requirepass"; password ]
     in
-    Array.of_list with_auth
+    let with_masterauth =
+      match masterauth with
+      | None -> with_auth
+      | Some password -> with_auth @ [ "--masterauth"; password ]
+    in
+    Array.of_list with_masterauth
   in
   let pid =
     Unix.create_process server_executable argv Unix.stdin Unix.stdout
@@ -171,9 +178,13 @@ let with_server ?replicaof ?rdb_file ?requirepass test_fn =
   in
   Fun.protect
     ~finally:(fun () ->
-      Unix.kill pid Sys.sigterm;
+      (try Unix.kill pid Sys.sigterm with Unix.Unix_error _ -> ());
       ignore (Unix.waitpid [] pid))
-    (fun () -> test_fn ~port ~connect:(fun () -> connect_with_retry port))
+    (fun () -> test_fn ~port ~pid ~connect:(fun () -> connect_with_retry port))
+
+let with_server ?replicaof ?rdb_file ?requirepass ?masterauth test_fn =
+  with_server_process ?replicaof ?rdb_file ?requirepass ?masterauth
+    (fun ~port ~pid:_ ~connect -> test_fn ~port ~connect)
 
 let resolve_host host =
   try Unix.inet_addr_of_string host
@@ -186,6 +197,7 @@ let connect_to_host_port ?(timeout_seconds = 2.0) ~host ~port () =
   match Unix.connect fd (Unix.ADDR_INET (inet_addr, port)) with
   | () ->
       Unix.clear_nonblock fd;
+      Unix.setsockopt_float fd Unix.SO_RCVTIMEO 15.0;
       fd
   | exception Unix.Unix_error (Unix.EINPROGRESS, _, _) ->
       let _, writable, _ = Unix.select [] [ fd ] [] timeout_seconds in
@@ -244,8 +256,7 @@ let send_command fd arguments =
   loop 0;
   read_reply fd
 
-let send_only fd arguments =
-  let payload = Redis.Resp.encode_command arguments in
+let send_raw_string fd payload =
   let rec loop offset =
     if offset < String.length payload then
       let written =
@@ -254,6 +265,9 @@ let send_only fd arguments =
       loop (offset + written)
   in
   loop 0
+
+let send_only fd arguments =
+  send_raw_string fd (Redis.Resp.encode_command arguments)
 
 let parse_integer_reply reply =
   if String.length reply < 4 || reply.[0] <> ':' then
@@ -276,6 +290,13 @@ let parse_bulk_float_reply reply =
       | Some value -> value
       | None -> fail ("expected float bulk reply, got " ^ reply))
   | _ -> fail ("unexpected bulk reply shape: " ^ reply)
+
+let parse_bulk_string_reply reply =
+  match String.split_on_char '\r' reply with
+  | length_line :: value :: _
+    when String.length length_line > 0 && length_line.[0] = '$' ->
+      value
+  | _ -> fail ("expected bulk string reply, got " ^ reply)
 
 let retry_until timeout_seconds f =
   let deadline = Unix.gettimeofday () +. timeout_seconds in
@@ -564,7 +585,11 @@ let test_engine_expiry () =
   ignore
     (Redis.Engine.handle ~now_ms:1_000L engine
        (Redis.Command.Set
-          { key = "greeting"; value = "hello"; expiry_ms = Some 500L }));
+          {
+            key = "greeting";
+            value = "hello";
+            expiry = Some (Redis.Command.Relative_ms 500L);
+          }));
   let value_before_expiry =
     match
       (Redis.Engine.handle ~now_ms:1_200L engine (Redis.Command.Get "greeting"))
@@ -1613,6 +1638,36 @@ let test_server_geo_wrong_type_and_validation () =
             ~actual:
               (send_command client [ "GEOADD"; "oops"; "200"; "0"; "bad" ])
             ~context:"invalid longitude rejected";
+          assert_string_equal
+            ~expected:
+              "-ERR invalid longitude,latitude pair 999.000000,999.000000\r\n"
+            ~actual:
+              (send_command client
+                 [
+                   "GEOSEARCH";
+                   "places";
+                   "FROMLONLAT";
+                   "999";
+                   "999";
+                   "BYRADIUS";
+                   "1";
+                   "m";
+                 ])
+            ~context:"geosearch invalid center rejected";
+          assert_string_equal ~expected:"-ERR radius cannot be negative\r\n"
+            ~actual:
+              (send_command client
+                 [
+                   "GEOSEARCH";
+                   "places";
+                   "FROMLONLAT";
+                   "0";
+                   "0";
+                   "BYRADIUS";
+                   "-1";
+                   "m";
+                 ])
+            ~context:"geosearch negative radius rejected";
           assert_wrongtype
             ~actual:(send_command client [ "ZRANGE"; "places"; "0"; "-1" ])
             ~context:"zrange on geo key wrongtype";
@@ -1705,6 +1760,10 @@ let test_auth_gate_matrix () =
           assert_noauth_command [ "WAIT"; "1"; "1000" ] "wait denied pre-auth";
           assert_noauth_command [ "INFO"; "replication" ]
             "info replication denied pre-auth";
+          assert_noauth_command
+            [ "REPLCONF"; "capa"; "psync2" ]
+            "replconf denied pre-auth";
+          assert_noauth_command [ "PSYNC"; "?"; "-1" ] "psync denied pre-auth";
           ignore (send_command authd [ "AUTH"; "secret" ]);
           assert_string_equal
             ~expected:"*3\r\n$9\r\nsubscribe\r\n$6\r\nalerts\r\n:1\r\n"
@@ -1785,35 +1844,10 @@ let test_replication_propagates_zset_and_geo_writes () =
                        Some reply
                      else None)))))
 
-let test_auth_startup_rejects_replica_mode () =
-  let port = !next_test_port in
-  incr next_test_port;
-  let upstream_port = !next_test_port in
-  incr next_test_port;
-  let devnull = Unix.openfile "/dev/null" [ Unix.O_WRONLY ] 0 in
-  let pid =
-    Unix.create_process server_executable
-      [|
-        server_executable;
-        "--port";
-        string_of_int port;
-        "--replicaof";
-        Printf.sprintf "127.0.0.1:%d" upstream_port;
-        "--requirepass";
-        "secret";
-      |]
-      Unix.stdin devnull devnull
-  in
-  let _, status = Unix.waitpid [] pid in
-  Unix.close devnull;
-  assert_bool
-    (match status with Unix.WEXITED 0 -> false | _ -> true)
-    ~context:"requirepass+replicaof should fail fast"
-
 let test_auth_enabled_master_allows_replica_replication () =
   with_server ~requirepass:"secret"
     (fun ~port:master_port ~connect:connect_master ->
-      with_server ~replicaof:("127.0.0.1", master_port)
+      with_server ~replicaof:("127.0.0.1", master_port) ~masterauth:"secret"
         (fun ~port:_ ~connect:connect_replica ->
           let master_auth = connect_master () in
           let master_unauth = connect_master () in
@@ -1828,6 +1862,13 @@ let test_auth_enabled_master_allows_replica_replication () =
                 ~actual:
                   (send_command master_unauth [ "SET"; "city"; "Toronto" ])
                 ~context:"normal unauthenticated client still gated";
+              assert_noauth
+                ~actual:
+                  (send_command master_unauth [ "REPLCONF"; "capa"; "psync2" ])
+                ~context:"replconf denied pre-auth";
+              assert_noauth
+                ~actual:(send_command master_unauth [ "PSYNC"; "?"; "-1" ])
+                ~context:"psync denied pre-auth";
               ignore
                 (retry_until 5.0 (fun () ->
                      let reply =
@@ -1869,25 +1910,33 @@ let test_auth_and_acl_subset () =
               "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
             ~actual:(send_command client [ "AUTH"; "wrong" ])
             ~context:"wrong password";
+          assert_string_equal
+            ~expected:
+              "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+            ~actual:(send_command client [ "AUTH"; String.make 2_000 'x' ])
+            ~context:"overlong password is rejected without hashing";
           assert_string_equal ~expected:"+OK\r\n"
             ~actual:(send_command client [ "AUTH"; "secret" ])
             ~context:"correct password";
           assert_string_equal ~expected:"$7\r\ndefault\r\n"
             ~actual:(send_command client [ "ACL"; "WHOAMI" ])
             ~context:"acl whoami";
+          let password_digest = Redis.Sha256.hex "secret" in
           assert_string_equal
             ~expected:
-              "*4\r\n\
-               $5\r\n\
-               flags\r\n\
-               *1\r\n\
-               $2\r\n\
-               on\r\n\
-               $9\r\n\
-               passwords\r\n\
-               *1\r\n\
-               $6\r\n\
-               secret\r\n"
+              (Printf.sprintf
+                 "*4\r\n\
+                  $5\r\n\
+                  flags\r\n\
+                  *1\r\n\
+                  $2\r\n\
+                  on\r\n\
+                  $9\r\n\
+                  passwords\r\n\
+                  *1\r\n\
+                  $64\r\n\
+                  %s\r\n"
+                 password_digest)
             ~actual:(send_command client [ "ACL"; "GETUSER"; "default" ])
             ~context:"acl getuser default exact shape";
           assert_string_equal ~expected:"$-1\r\n"
@@ -2125,6 +2174,470 @@ let test_server_errors () =
             (String.starts_with ~prefix:"-ERR protocol error:" reply)
             ~context:"protocol error prefix"))
 
+let test_engine_absolute_expiry () =
+  let engine = Redis.Engine.create () in
+  let command =
+    Redis.Command.Set
+      {
+        key = "absolute";
+        value = "value";
+        expiry = Some (Redis.Command.Absolute_ms 1_500L);
+      }
+  in
+  ignore (Redis.Engine.handle ~now_ms:1_000L engine command);
+  assert_string_equal
+    ~expected:
+      "*5\r\n\
+       $3\r\n\
+       SET\r\n\
+       $8\r\n\
+       absolute\r\n\
+       $5\r\n\
+       value\r\n\
+       $4\r\n\
+       PXAT\r\n\
+       $4\r\n\
+       1500\r\n"
+    ~actual:
+      (match Redis.Command.to_arguments command with
+      | Some arguments -> Redis.Resp.encode_command arguments
+      | None -> fail "expected SET to be re-encodable")
+    ~context:"absolute expiry re-encodes as PXAT";
+  assert_bool
+    (match
+       (Redis.Engine.handle ~now_ms:1_499L engine (Redis.Command.Get "absolute"))
+         .reply
+     with
+    | Some (Redis.Resp.Bulk_string (Some "value")) -> true
+    | _ -> false)
+    ~context:"absolute expiry keeps the value before its deadline";
+  assert_bool
+    (match
+       (Redis.Engine.handle ~now_ms:1_500L engine (Redis.Command.Get "absolute"))
+         .reply
+     with
+    | Some (Redis.Resp.Bulk_string None) -> true
+    | _ -> false)
+    ~context:"absolute expiry removes the value at its deadline"
+
+let test_engine_incr_overflow () =
+  let engine = Redis.Engine.create () in
+  ignore
+    (Redis.Engine.handle ~now_ms:0L engine
+       (Redis.Command.Set
+          { key = "n"; value = Int64.to_string Int64.max_int; expiry = None }));
+  match
+    (Redis.Engine.handle ~now_ms:0L engine (Redis.Command.Incr "n")).reply
+  with
+  | Some (Redis.Resp.Error message) ->
+      assert_string_equal ~expected:"increment or decrement would overflow"
+        ~actual:message ~context:"incr overflow error"
+  | _ -> fail "expected INCR overflow to return an error reply"
+
+let test_strict_integer_and_expiry_edges () =
+  with_server (fun ~port:_ ~connect ->
+      let client = connect () in
+      Fun.protect
+        ~finally:(fun () -> Unix.close client)
+        (fun () ->
+          ignore (send_command client [ "SET"; "counter"; "0x10" ]);
+          assert_string_equal
+            ~expected:"-ERR value is not an integer or out of range\r\n"
+            ~actual:(send_command client [ "INCR"; "counter" ])
+            ~context:"hexadecimal stored counters are rejected";
+          ignore (send_command client [ "SET"; "leading"; "007" ]);
+          assert_string_equal ~expected:":8\r\n"
+            ~actual:(send_command client [ "INCR"; "leading" ])
+            ~context:"leading zeroes remain valid decimal input";
+          ignore
+            (send_command client [ "SET"; "maximum"; "9223372036854775807" ]);
+          assert_string_equal
+            ~expected:"-ERR increment or decrement would overflow\r\n"
+            ~actual:(send_command client [ "INCR"; "maximum" ])
+            ~context:"INCR overflow is reported instead of wrapping";
+          assert_string_equal
+            ~expected:"-ERR value is not an integer or out of range: +0\r\n"
+            ~actual:(send_command client [ "LRANGE"; "list"; "+0"; "-1" ])
+            ~context:"range bounds reject leading plus signs";
+          assert_string_equal
+            ~expected:"-ERR value is not an integer or out of range: 0x10\r\n"
+            ~actual:
+              (send_command client [ "SET"; "ttl"; "value"; "EX"; "0x10" ])
+            ~context:"expiry rejects hexadecimal numbers";
+          ignore (send_command client [ "SET"; "past"; "value"; "PXAT"; "1" ]);
+          assert_string_equal ~expected:"$-1\r\n"
+            ~actual:(send_command client [ "GET"; "past" ])
+            ~context:"a past PXAT deadline expires immediately";
+          ignore
+            (send_command client
+               [ "SET"; "future"; "value"; "PXAT"; "9223372036854775807" ]);
+          assert_string_equal ~expected:"$5\r\nvalue\r\n"
+            ~actual:(send_command client [ "GET"; "future" ])
+            ~context:"a distant PXAT deadline keeps the value"))
+
+let test_resp_limits_reject_oversized_frames () =
+  with_server (fun ~port:_ ~connect ->
+      let expect_protocol_error payload context =
+        let client = connect () in
+        Fun.protect
+          ~finally:(fun () ->
+            try Unix.close client with Unix.Unix_error _ -> ())
+          (fun () ->
+            send_raw_string client payload;
+            let reply = read_reply client in
+            assert_contains ~needle:"protocol error" ~haystack:reply ~context)
+      in
+      expect_protocol_error "*1\r\n$999999999999999999999\r\n"
+        "an overflowing bulk length is rejected";
+      expect_protocol_error "*1\r\n$-2\r\n"
+        "a negative bulk length other than -1 is rejected";
+      expect_protocol_error "*1\r\n$70000000\r\n"
+        "a bulk length above the ceiling is rejected";
+      expect_protocol_error "*1048577\r\n"
+        "an array length above the ceiling is rejected")
+
+let test_blocked_pipeline_resumes_after_wakeup () =
+  with_server (fun ~port:_ ~connect ->
+      let blocked = connect () in
+      let producer = connect () in
+      Fun.protect
+        ~finally:(fun () ->
+          Unix.close blocked;
+          Unix.close producer)
+        (fun () ->
+          send_raw_string blocked
+            (Redis.Resp.encode_command [ "BLPOP"; "pipeline"; "0" ]
+            ^ Redis.Resp.encode_command [ "PING" ]);
+          Unix.sleepf 0.1;
+          assert_string_equal ~expected:":1\r\n"
+            ~actual:(send_command producer [ "RPUSH"; "pipeline"; "job" ])
+            ~context:"producer wakes the pipelined blocked client";
+          assert_string_equal
+            ~expected:"*2\r\n$8\r\npipeline\r\n$3\r\njob\r\n+PONG\r\n"
+            ~actual:(read_until_quiet blocked)
+            ~context:"commands buffered behind BLPOP run after the wakeup"))
+
+let test_xread_fans_out_to_all_waiters () =
+  with_server (fun ~port:_ ~connect ->
+      let reader_a = connect () in
+      let reader_b = connect () in
+      let writer = connect () in
+      Fun.protect
+        ~finally:(fun () ->
+          Unix.close reader_a;
+          Unix.close reader_b;
+          Unix.close writer)
+        (fun () ->
+          let request =
+            Redis.Resp.encode_command
+              [ "XREAD"; "BLOCK"; "0"; "STREAMS"; "fanout"; "$" ]
+          in
+          send_raw_string reader_a request;
+          send_raw_string reader_b request;
+          Unix.sleepf 0.2;
+          ignore (send_command writer [ "XADD"; "fanout"; "1-0"; "f"; "v" ]);
+          let expected =
+            "*1\r\n\
+             *2\r\n\
+             $6\r\n\
+             fanout\r\n\
+             *1\r\n\
+             *2\r\n\
+             $3\r\n\
+             1-0\r\n\
+             *2\r\n\
+             $1\r\n\
+             f\r\n\
+             $1\r\n\
+             v\r\n"
+          in
+          assert_string_equal ~expected
+            ~actual:(read_until_quiet reader_a)
+            ~context:"first XREAD waiter receives the entry";
+          assert_string_equal ~expected
+            ~actual:(read_until_quiet reader_b)
+            ~context:"second XREAD waiter receives the same entry"))
+
+let test_blpop_replication_propagates_the_pop () =
+  with_server (fun ~port:master_port ~connect:connect_master ->
+      with_server ~replicaof:("127.0.0.1", master_port)
+        (fun ~port:_ ~connect:connect_replica ->
+          let blocked = connect_master () in
+          let producer = connect_master () in
+          let replica = connect_replica () in
+          Fun.protect
+            ~finally:(fun () ->
+              Unix.close blocked;
+              Unix.close producer;
+              Unix.close replica)
+            (fun () ->
+              ignore
+                (retry_until 5.0 (fun () ->
+                     let reply =
+                       send_command replica [ "INFO"; "replication" ]
+                     in
+                     if string_contains reply "master_link_status:up" then
+                       Some reply
+                     else None));
+              send_only blocked [ "BLPOP"; "jobs"; "2" ];
+              Unix.sleepf 0.1;
+              assert_string_equal ~expected:":1\r\n"
+                ~actual:(send_command producer [ "RPUSH"; "jobs"; "job" ])
+                ~context:"producer wakes the blocking pop";
+              assert_string_equal ~expected:"*2\r\n$4\r\njobs\r\n$3\r\njob\r\n"
+                ~actual:(read_reply blocked)
+                ~context:"blocked client receives the popped value";
+              ignore (send_command producer [ "RPUSH"; "marker"; "applied" ]);
+              ignore
+                (retry_until 2.0 (fun () ->
+                     let reply = send_command replica [ "LLEN"; "marker" ] in
+                     if reply = ":1\r\n" then Some reply else None));
+              assert_string_equal ~expected:":0\r\n"
+                ~actual:(send_command replica [ "LLEN"; "jobs" ])
+                ~context:"replica applies the pop instead of keeping the value")))
+
+let test_lowercase_subcommands_and_keywords () =
+  with_server (fun ~port:_ ~connect ->
+      let client = connect () in
+      Fun.protect
+        ~finally:(fun () -> Unix.close client)
+        (fun () ->
+          assert_string_equal ~expected:"$7\r\ndefault\r\n"
+            ~actual:(send_command client [ "acl"; "whoami" ])
+            ~context:"lowercase ACL subcommand";
+          assert_string_equal ~expected:"+OK\r\n"
+            ~actual:(send_command client [ "replconf"; "capa"; "psync2" ])
+            ~context:"lowercase REPLCONF arguments";
+          assert_contains ~needle:"role:master"
+            ~haystack:(send_command client [ "info"; "REPLICATION" ])
+            ~context:"lowercase INFO section";
+          ignore (send_command client [ "geoadd"; "geo"; "0"; "0"; "a" ]);
+          assert_string_equal ~expected:"*1\r\n$1\r\na\r\n"
+            ~actual:
+              (send_command client
+                 [
+                   "geosearch";
+                   "geo";
+                   "fromlonlat";
+                   "0";
+                   "0";
+                   "byradius";
+                   "1";
+                   "M";
+                 ])
+            ~context:"lowercase GEOSEARCH keywords and uppercase unit";
+          assert_string_equal ~expected:"$1\r\n0\r\n"
+            ~actual:(send_command client [ "geodist"; "geo"; "a"; "a"; "KM" ])
+            ~context:"uppercase GEODIST unit";
+          ignore (send_command client [ "xadd"; "ci-stream"; "1-0"; "f"; "v" ]);
+          assert_contains ~needle:"$9\r\nci-stream"
+            ~haystack:
+              (send_command client
+                 [ "xread"; "block"; "10"; "streams"; "ci-stream"; "0-0" ])
+            ~context:"lowercase XREAD keywords"))
+
+let test_writes_to_disconnected_clients_do_not_kill_server () =
+  with_server (fun ~port:_ ~connect ->
+      let subscriber = connect () in
+      ignore (send_command subscriber [ "SUBSCRIBE"; "events" ]);
+      Unix.close subscriber;
+      let publisher = connect () in
+      Fun.protect
+        ~finally:(fun () -> Unix.close publisher)
+        (fun () ->
+          Unix.sleepf 0.1;
+          ignore (send_command publisher [ "PUBLISH"; "events"; "one" ]);
+          Unix.sleepf 0.05;
+          ignore (send_command publisher [ "PUBLISH"; "events"; "two" ]);
+          assert_string_equal ~expected:"+PONG\r\n"
+            ~actual:(send_command publisher [ "PING" ])
+            ~context:"server survives writes to a disconnected subscriber"))
+
+let test_replication_preserves_absolute_expiry () =
+  with_server_process (fun ~port:master_port ~pid:_ ~connect:connect_master ->
+      with_server_process ~replicaof:("127.0.0.1", master_port)
+        (fun ~port:_ ~pid:replica_pid ~connect:connect_replica ->
+          let master = connect_master () in
+          let replica = connect_replica () in
+          Fun.protect
+            ~finally:(fun () ->
+              (try Unix.kill replica_pid Sys.sigcont with _ -> ());
+              Unix.close master;
+              Unix.close replica)
+            (fun () ->
+              ignore
+                (retry_until 5.0 (fun () ->
+                     let reply =
+                       send_command replica [ "INFO"; "replication" ]
+                     in
+                     if string_contains reply "master_link_status:up" then
+                       Some reply
+                     else None));
+              Unix.kill replica_pid Sys.sigstop;
+              Unix.sleepf 0.05;
+              assert_string_equal ~expected:"+OK\r\n"
+                ~actual:
+                  (send_command master [ "SET"; "temp"; "value"; "PX"; "600" ])
+                ~context:"master accepts a relative expiry";
+              Unix.sleepf 0.5;
+              assert_string_equal ~expected:"+OK\r\n"
+                ~actual:(send_command master [ "SET"; "marker"; "yes" ])
+                ~context:"marker write queues behind the delayed expiry";
+              Unix.kill replica_pid Sys.sigcont;
+              ignore
+                (retry_until 2.0 (fun () ->
+                     let reply = send_command replica [ "GET"; "marker" ] in
+                     if reply = "$3\r\nyes\r\n" then Some reply else None));
+              Unix.sleepf 0.3;
+              assert_string_equal ~expected:"$-1\r\n"
+                ~actual:(send_command master [ "GET"; "temp" ])
+                ~context:"master expires the key on schedule";
+              assert_string_equal ~expected:"$-1\r\n"
+                ~actual:(send_command replica [ "GET"; "temp" ])
+                ~context:"replica honors the master's absolute deadline")))
+
+let test_replication_preserves_generated_stream_ids () =
+  with_server_process (fun ~port:master_port ~pid:_ ~connect:connect_master ->
+      with_server_process ~replicaof:("127.0.0.1", master_port)
+        (fun ~port:_ ~pid:replica_pid ~connect:connect_replica ->
+          let master = connect_master () in
+          let replica = connect_replica () in
+          Fun.protect
+            ~finally:(fun () ->
+              (try Unix.kill replica_pid Sys.sigcont with _ -> ());
+              Unix.close master;
+              Unix.close replica)
+            (fun () ->
+              ignore
+                (retry_until 5.0 (fun () ->
+                     let reply =
+                       send_command replica [ "INFO"; "replication" ]
+                     in
+                     if string_contains reply "master_link_status:up" then
+                       Some reply
+                     else None));
+              Unix.kill replica_pid Sys.sigstop;
+              Unix.sleepf 0.05;
+              let master_id =
+                parse_bulk_string_reply
+                  (send_command master [ "XADD"; "stream"; "*"; "f"; "v" ])
+              in
+              Unix.sleepf 0.4;
+              Unix.kill replica_pid Sys.sigcont;
+              let replica_range =
+                retry_until 2.0 (fun () ->
+                    let reply =
+                      send_command replica [ "XRANGE"; "stream"; "-"; "+" ]
+                    in
+                    if reply = "*0\r\n" then None else Some reply)
+              in
+              assert_contains ~needle:master_id ~haystack:replica_range
+                ~context:
+                  "replica stores the master-generated stream id verbatim")))
+
+let test_error_replies_cannot_inject_frames () =
+  with_server (fun ~port:_ ~connect ->
+      let client = connect () in
+      Fun.protect
+        ~finally:(fun () -> Unix.close client)
+        (fun () ->
+          let single_frame reply context =
+            let lines = String.split_on_char '\n' reply in
+            assert_bool (List.length lines = 2) ~context;
+            assert_bool (String.length reply < 1024) ~context
+          in
+          let injected =
+            send_command client [ "SET"; "key"; "value"; "EX"; "1\r\n+PWN" ]
+          in
+          assert_string_starts_with ~prefix:"-ERR " ~actual:injected
+            ~context:"injected expiry value is an error";
+          single_frame injected "an injected expiry value stays in one frame";
+          let oversized =
+            send_command client
+              [ "SET"; "key"; "value"; "EX"; String.make 10_000 '9' ]
+          in
+          assert_string_starts_with ~prefix:"-ERR " ~actual:oversized
+            ~context:"oversized invalid integer is an error";
+          single_frame oversized "an oversized diagnostic is truncated";
+          let unknown = send_command client [ "EVIL\r\n+PWN" ] in
+          assert_string_starts_with ~prefix:"-ERR " ~actual:unknown
+            ~context:"unknown command with CRLF stays an error";
+          single_frame unknown "an unknown command name stays in one frame"))
+
+let test_transactions_support_publish_and_info () =
+  with_server (fun ~port:_ ~connect ->
+      let subscriber = connect () in
+      let client = connect () in
+      Fun.protect
+        ~finally:(fun () ->
+          Unix.close subscriber;
+          Unix.close client)
+        (fun () ->
+          ignore (send_command subscriber [ "SUBSCRIBE"; "tx-channel" ]);
+          assert_string_equal ~expected:"+OK\r\n"
+            ~actual:(send_command client [ "MULTI" ])
+            ~context:"multi opens";
+          assert_string_equal ~expected:"+QUEUED\r\n"
+            ~actual:(send_command client [ "PUBLISH"; "tx-channel"; "hello" ])
+            ~context:"publish queues";
+          assert_string_equal ~expected:"+QUEUED\r\n"
+            ~actual:(send_command client [ "INFO"; "replication" ])
+            ~context:"info queues";
+          let exec_reply = send_command client [ "EXEC" ] in
+          assert_string_starts_with ~prefix:"*2\r\n:1\r\n$" ~actual:exec_reply
+            ~context:"exec returns publish count and info bulk";
+          assert_contains ~needle:"role:master" ~haystack:exec_reply
+            ~context:"info runs inside exec";
+          assert_string_equal
+            ~expected:
+              "*3\r\n$7\r\nmessage\r\n$10\r\ntx-channel\r\n$5\r\nhello\r\n"
+            ~actual:(read_reply subscriber)
+            ~context:"publish inside exec reaches subscribers"))
+
+let test_replica_resolves_hostnames () =
+  with_server (fun ~port:master_port ~connect:connect_master ->
+      with_server ~replicaof:("localhost", master_port)
+        (fun ~port:_ ~connect:connect_replica ->
+          let master = connect_master () in
+          let replica = connect_replica () in
+          Fun.protect
+            ~finally:(fun () ->
+              Unix.close master;
+              Unix.close replica)
+            (fun () ->
+              ignore
+                (retry_until 5.0 (fun () ->
+                     let reply =
+                       send_command replica [ "INFO"; "replication" ]
+                     in
+                     if string_contains reply "master_link_status:up" then
+                       Some reply
+                     else None));
+              ignore (send_command master [ "SET"; "hostname"; "works" ]);
+              let reply =
+                retry_until 2.0 (fun () ->
+                    let reply = send_command replica [ "GET"; "hostname" ] in
+                    if reply = "$5\r\nworks\r\n" then Some reply else None)
+              in
+              assert_string_equal ~expected:"$5\r\nworks\r\n" ~actual:reply
+                ~context:"hostname upstream is resolved and replicated")))
+
+let test_sha256_known_vectors () =
+  let check input expected context =
+    assert_string_equal ~expected ~actual:(Redis.Sha256.hex input) ~context
+  in
+  check "" "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    "sha256 empty string";
+  check "abc" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    "sha256 abc";
+  check "The quick brown fox jumps over the lazy dog"
+    "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
+    "sha256 quick brown fox";
+  check
+    (String.make 1_000_000 'a')
+    "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+    "sha256 one million a"
+
 let tests =
   [
     ("manual clock starts at configured instant", test_manual_clock_initial);
@@ -2134,6 +2647,10 @@ let tests =
     ( "expiry logic can be driven without real sleeps",
       test_expiry_without_real_sleeps );
     ("engine set/get honors expiry deterministically", test_engine_expiry);
+    ( "engine treats absolute expiries as absolute instants",
+      test_engine_absolute_expiry );
+    ("engine reports INCR overflow", test_engine_incr_overflow);
+    ("sha256 matches published vectors", test_sha256_known_vectors);
     ("engine supports basic list operations", test_engine_list_operations);
     ("engine supports sorted set operations", test_engine_sorted_set_operations);
     ("server responds to ping and repeated pings", test_server_ping);
@@ -2195,8 +2712,6 @@ let tests =
     ("server wrong-type matrix smoke test", test_server_wrong_type_matrix_smoke);
     ( "server missing-key reply shapes are consistent",
       test_server_missing_key_reply_shapes );
-    ( "auth rejects replica mode at startup",
-      test_auth_startup_rejects_replica_mode );
     ( "auth-enabled master still allows replica sync",
       test_auth_enabled_master_allows_replica_replication );
     ("auth and acl subset works", test_auth_and_acl_subset);
@@ -2217,6 +2732,29 @@ let tests =
       test_sorted_set_reply_shape_edges );
     ("geodist reply-shape edges are compatible", test_geodist_reply_shape_edges);
     ("server returns command errors and protocol errors", test_server_errors);
+    ( "strict integer and expiry edge cases are enforced",
+      test_strict_integer_and_expiry_edges );
+    ( "RESP limits reject oversized frames",
+      test_resp_limits_reject_oversized_frames );
+    ( "commands buffered behind a blocking pop run after the wakeup",
+      test_blocked_pipeline_resumes_after_wakeup );
+    ( "blocking XREAD fans out to every waiter",
+      test_xread_fans_out_to_all_waiters );
+    ( "replication propagates the pop performed by a blocked BLPOP",
+      test_blpop_replication_propagates_the_pop );
+    ( "lowercase subcommands and keywords are accepted",
+      test_lowercase_subcommands_and_keywords );
+    ( "writes to disconnected clients do not kill the server",
+      test_writes_to_disconnected_clients_do_not_kill_server );
+    ( "replication preserves absolute expiry deadlines",
+      test_replication_preserves_absolute_expiry );
+    ( "replication preserves generated stream ids",
+      test_replication_preserves_generated_stream_ids );
+    ("replicas resolve hostname upstreams", test_replica_resolves_hostnames);
+    ( "error replies cannot inject extra protocol frames",
+      test_error_replies_cannot_inject_frames );
+    ( "transactions support PUBLISH and INFO",
+      test_transactions_support_publish_and_info );
   ]
 
 let run_tests tests =

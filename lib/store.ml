@@ -2,7 +2,8 @@ type stream_id = { ms : int64; seq : int64 }
 type stream_entry = { id : stream_id; fields : (string * string) list }
 
 type stream = {
-  mutable entries : stream_entry list;
+  (* Newest first. XADD is the hot path; reads reverse once. *)
+  mutable entries_rev : stream_entry list;
   mutable last_id : stream_id option;
 }
 
@@ -25,10 +26,13 @@ type t = {
 }
 
 type wrong_type = [ `Wrong_type ]
-type incr_error = [ wrong_type | `Not_an_integer ]
+type incr_error = [ wrong_type | `Not_an_integer | `Overflow ]
 type 'a lookup = [ `Missing | `Value of 'a | wrong_type ]
 type key_type = [ `None | `String | `List | `Stream | `Zset ]
 type geo_lookup = (float * float) option
+
+type geosearch_error =
+  [ wrong_type | `Invalid_center of float * float | `Invalid_radius of float ]
 
 type stream_write_error =
   [ wrong_type | `Invalid_stream_id of string | `Id_not_greater | `Id_too_small ]
@@ -57,7 +61,7 @@ let min_stream_id = { ms = 0L; seq = 1L }
 let stream_id_to_string { ms; seq } = Printf.sprintf "%Ld-%Ld" ms seq
 
 let parse_non_negative_int64 value =
-  match Int64.of_string_opt value with
+  match Integer.of_string_opt value with
   | Some parsed when parsed >= 0L -> Some parsed
   | _ -> None
 
@@ -152,8 +156,9 @@ let incr_string ~now_ms store ~key =
       Ok 1L
   | Some { value = List _ | Stream _ | Zset _ | Geo _; _ } -> Error `Wrong_type
   | Some { value = String value; expires_at_ms } -> (
-      match Int64.of_string_opt value with
+      match Integer.of_string_opt value with
       | None -> Error `Not_an_integer
+      | Some current when Int64.equal current Int64.max_int -> Error `Overflow
       | Some current ->
           let next = Int64.add current 1L in
           Hashtbl.replace store.entries key
@@ -456,17 +461,21 @@ let geodist ~now_ms store ~key ~member1 ~member2 =
       | _ -> Ok None)
 
 let geosearch ~now_ms store ~key ~longitude ~latitude ~radius_meters =
-  with_geo ~now_ms store key
-    (fun () -> Ok [])
-    (fun geo _ ->
-      let center = (longitude, latitude) in
-      Ok
-        (Hashtbl.to_seq geo |> List.of_seq
-        |> List.filter_map (fun (member, position) ->
-            if haversine_distance_meters center position <= radius_meters then
-              Some member
-            else None)
-        |> List.sort String.compare))
+  if not (valid_longitude longitude && valid_latitude latitude) then
+    Error (`Invalid_center (longitude, latitude))
+  else if radius_meters < 0. then Error (`Invalid_radius radius_meters)
+  else
+    with_geo ~now_ms store key
+      (fun () -> Ok [])
+      (fun geo _ ->
+        let center = (longitude, latitude) in
+        Ok
+          (Hashtbl.to_seq geo |> List.of_seq
+          |> List.filter_map (fun (member, position) ->
+              if haversine_distance_meters center position <= radius_meters then
+                Some member
+              else None)
+          |> List.sort String.compare))
 
 let next_auto_id stream ~now_ms =
   match stream.last_id with
@@ -493,13 +502,13 @@ let validate_explicit_id stream id =
     | _ -> Ok id
 
 let append_stream_entry store key (stream : stream) expires_at_ms entry =
-  stream.entries <- stream.entries @ [ entry ];
+  stream.entries_rev <- entry :: stream.entries_rev;
   stream.last_id <- Some entry.id;
   Hashtbl.replace store.entries key { value = Stream stream; expires_at_ms };
   bump_version store key
 
 let xadd ~now_ms store ~key ~id_spec fields =
-  let create_stream () = { entries = []; last_id = None } in
+  let create_stream () = { entries_rev = []; last_id = None } in
   let perform stream expires_at_ms =
     match parse_xadd_id_spec id_spec with
     | Error (`Invalid_stream_id raw) -> Error (`Invalid_stream_id raw)
@@ -564,7 +573,7 @@ let xrange ~now_ms store ~key ~start_spec ~end_spec =
           Ok
             (List.filter
                (fun entry -> within_range start_bound end_bound entry.id)
-               stream.entries))
+               (List.rev stream.entries_rev)))
 
 let xread ~now_ms store ~queries =
   let parse_query (key, raw_id) =
@@ -577,7 +586,7 @@ let xread ~now_ms store ~queries =
         match
           with_stream ~now_ms store key
             (fun () -> Ok [])
-            (fun stream _ -> Ok stream.entries)
+            (fun stream _ -> Ok (List.rev stream.entries_rev))
         with
         | Error `Wrong_type -> Error `Wrong_type
         | Ok entries ->

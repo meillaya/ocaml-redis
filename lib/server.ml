@@ -40,30 +40,39 @@ type replica_upstream = {
 
 type source = External_client | Master_stream
 
+(* A single request may legitimately be large, but the daemon must not buffer
+   an unbounded stream from a client that never completes a frame. 128 MiB is
+   twice the per-bulk ceiling, leaving room for framing and pipelining. *)
+let max_client_buffer = 128 * 1024 * 1024
+let max_rdb_payload = 64 * 1024 * 1024
+
 let write_all fd data =
   let rec loop offset =
     if offset < String.length data then
-      let written =
+      match
         Unix.write_substring fd data offset (String.length data - offset)
-      in
-      if written = 0 then raise End_of_file else loop (offset + written)
+      with
+      | 0 -> raise End_of_file
+      | written -> loop (offset + written)
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> loop offset
   in
   loop 0
+
+let close_client client =
+  if not client.closed then (
+    client.closed <- true;
+    try Unix.close client.fd with Unix.Unix_error _ -> ())
 
 let send_raw client data =
   if not client.closed then
     match write_all client.fd data with
     | () -> ()
-    | exception Unix.Unix_error ((Unix.EPIPE | Unix.ECONNRESET), _, _) ->
-        client.closed <- true
+    | exception Unix.Unix_error _ -> close_client client
+    | exception Sys_error _ -> close_client client
+    | exception End_of_file -> close_client client
 
 let send_reply client reply =
   if not client.closed then send_raw client (Resp.encode_reply reply)
-
-let close_client client =
-  if not client.closed then (
-    client.closed <- true;
-    Unix.close client.fd)
 
 let current_time_ms clock = Clock.System.now_ms clock
 let clear_watches client = Hashtbl.reset client.watched
@@ -72,11 +81,12 @@ let transaction_error client message = send_reply client (Resp.Error message)
 let subscription_count client = Hashtbl.length client.subscriptions
 let client_is_subscribed client = subscription_count client > 0
 let noauth_message = "Authentication required."
+let max_password_length = 1024
 let wrongpass_message = "invalid username-password pair or user is disabled."
 let auth_is_configured requirepass = Option.is_some requirepass
 
 let auth_exempt_command = function
-  | Command.Auth _ | Ping _ | Replconf _ | Psync _ -> true
+  | Command.Auth _ | Ping _ -> true
   | _ -> false
 
 let auth_rejected ~source ~requirepass client command =
@@ -93,7 +103,8 @@ let acl_getuser_reply ~requirepass =
     | None ->
         ([ Resp.Bulk_string (Some "on"); Resp.Bulk_string (Some "nopass") ], [])
     | Some password ->
-        ([ Resp.Bulk_string (Some "on") ], [ Resp.Bulk_string (Some password) ])
+        ( [ Resp.Bulk_string (Some "on") ],
+          [ Resp.Bulk_string (Some (Sha256.hex password)) ] )
   in
   Resp.Array
     [
@@ -103,6 +114,21 @@ let acl_getuser_reply ~requirepass =
       Resp.Array passwords;
     ]
 
+let constant_time_equal left right =
+  if String.length left <> String.length right then false
+  else
+    let difference = ref 0 in
+    for index = 0 to String.length left - 1 do
+      difference :=
+        !difference lor (Char.code left.[index] lxor Char.code right.[index])
+    done;
+    !difference = 0
+
+let password_matches ~expected provided =
+  (* Comparing fixed-width digests keeps both the password contents and its
+     length out of the comparison's control flow. *)
+  constant_time_equal (Sha256.hex expected) (Sha256.hex provided)
+
 let handle_auth_command ~requirepass client password =
   match requirepass with
   | None ->
@@ -111,7 +137,10 @@ let handle_auth_command ~requirepass client password =
            "AUTH <password> called without any password configured for the \
             default user")
   | Some expected_password ->
-      if password = expected_password then (
+      if
+        String.length password <= max_password_length
+        && password_matches ~expected:expected_password password
+      then (
         client.authenticated <- true;
         send_reply client (Resp.Simple_string "OK"))
       else
@@ -134,14 +163,10 @@ let mark_transaction_dirty client message =
 let queueable_in_transaction = function
   | Command.Multi | Exec | Discard | Watch _ | Unwatch -> false
   | Blpop _ | Xread _ | Wait _ -> false
-  | Info _ | Replconf _ | Psync _ -> false
+  | Replconf _ | Psync _ -> false
+  | Auth _ | AclWhoami | AclGetuser _ -> false
+  | Subscribe _ | Unsubscribe _ -> false
   | _ -> true
-
-let command_is_write = function
-  | Command.Set _ | Rpush _ | Lpush _ | Lrem _ | Blpop _ | Incr _ | Zadd _
-  | Zrem _ | Geoadd _ | Xadd _ ->
-      true
-  | _ -> false
 
 let generate_replid () =
   let hex = "0123456789abcdef" in
@@ -161,6 +186,8 @@ let read_frame_blocking fd buffer_ref =
         | 0 -> failwith "unexpected EOF while reading replication handshake"
         | read ->
             buffer_ref := !buffer_ref ^ Bytes.sub_string chunk 0 read;
+            if String.length !buffer_ref > max_client_buffer then
+              failwith "replication handshake response exceeds buffer limit";
             loop ())
   in
   loop ()
@@ -189,6 +216,8 @@ let read_rdb_payload_blocking fd buffer_ref =
             (String.length !buffer_ref - stop - 2);
         line
     | None ->
+        if String.length !buffer_ref > 64 then
+          failwith "invalid RDB length line after FULLRESYNC";
         read_more ();
         read_length_line ()
   in
@@ -197,10 +226,12 @@ let read_rdb_payload_blocking fd buffer_ref =
     failwith "expected RDB bulk length after FULLRESYNC";
   let payload_length =
     match
-      int_of_string_opt
+      Integer.to_int_opt
         (String.sub length_line 1 (String.length length_line - 1))
     with
-    | Some length when length >= 0 -> length
+    | Some length when length >= 0 && length <= max_rdb_payload -> length
+    | Some length when length > max_rdb_payload ->
+        failwith "RDB payload after FULLRESYNC exceeds the supported limit"
     | _ -> failwith "invalid RDB bulk length after FULLRESYNC"
   in
   let rec ensure_payload () =
@@ -216,17 +247,41 @@ let read_rdb_payload_blocking fd buffer_ref =
     String.length !buffer_ref >= 2
     && !buffer_ref.[0] = '\r'
     && !buffer_ref.[1] = '\n'
-  then buffer_ref := String.sub !buffer_ref 2 (String.length !buffer_ref - 2)
+  then buffer_ref := String.sub !buffer_ref 2 (String.length !buffer_ref - 2);
+  payload_length
 
-let connect_to_master ~host ~port ~listening_port =
-  let inet = Unix.inet_addr_of_string host in
+let resolve_master_addresses host port =
+  try
+    Unix.getaddrinfo host (string_of_int port)
+      [ Unix.AI_SOCKTYPE Unix.SOCK_STREAM ]
+    |> List.map (fun address -> address.Unix.ai_addr)
+  with Unix.Unix_error _ | Not_found -> []
+
+let connect_to_master ~host ~port ~listening_port ~masterauth =
+  let addresses = resolve_master_addresses host port in
+  if addresses = [] then
+    failwith
+      (Printf.sprintf "could not resolve replica upstream %s:%d" host port);
   let deadline = Unix.gettimeofday () +. 5.0 in
+  let try_addresses addresses =
+    let rec loop = function
+      | [] -> None
+      | address :: rest -> (
+          let fd =
+            Unix.socket (Unix.domain_of_sockaddr address) Unix.SOCK_STREAM 0
+          in
+          match Unix.connect fd address with
+          | () -> Some fd
+          | exception Unix.Unix_error _ ->
+              Unix.close fd;
+              loop rest)
+    in
+    loop addresses
+  in
   let rec connect_with_retry () =
-    let fd = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-    match Unix.connect fd (Unix.ADDR_INET (inet, port)) with
-    | () -> fd
-    | exception Unix.Unix_error _ ->
-        Unix.close fd;
+    match try_addresses addresses with
+    | Some fd -> fd
+    | None ->
         if Unix.gettimeofday () >= deadline then
           failwith "replica could not connect to master in time"
         else (
@@ -245,6 +300,11 @@ let connect_to_master ~host ~port ~listening_port =
   in
   send_command [ "PING" ];
   expect_simple "PONG";
+  Option.iter
+    (fun password ->
+      send_command [ "AUTH"; password ];
+      expect_simple "OK")
+    masterauth;
   send_command [ "REPLCONF"; "listening-port"; string_of_int listening_port ];
   expect_simple "OK";
   send_command [ "REPLCONF"; "capa"; "psync2" ];
@@ -262,13 +322,27 @@ let connect_to_master ~host ~port ~listening_port =
         | _ -> failwith "unexpected FULLRESYNC line")
     | _ -> failwith "expected FULLRESYNC simple string"
   in
-  read_rdb_payload_blocking fd handshake_buffer;
+  let discarded_rdb_bytes = read_rdb_payload_blocking fd handshake_buffer in
+  if discarded_rdb_bytes > 0 then
+    Printf.eprintf
+      "ocaml-redis: warning: discarded %d bytes of full-resync RDB data; this \
+       subset only imports writes made after the replica connects\n\
+       %!"
+      discarded_rdb_bytes;
   { host; port; fd; buffer = ""; replid; offset; link_status = "up" }
 
-let run ~port ~replicaof ~rdb_file ~requirepass =
+let run ~port ~replicaof ~rdb_file ~requirepass ~masterauth =
   Random.self_init ();
-  if Option.is_some requirepass && Option.is_some replicaof then
-    failwith "--requirepass cannot be combined with --replicaof in this subset";
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
+  let validate_password option_name = function
+    | Some password when String.length password > max_password_length ->
+        failwith
+          (Printf.sprintf "%s is longer than the %d-byte limit" option_name
+             max_password_length)
+    | Some _ | None -> ()
+  in
+  validate_password "--requirepass" requirepass;
+  validate_password "--masterauth" masterauth;
   let stop = ref false in
   let () =
     Sys.set_signal Sys.sigterm (Sys.Signal_handle (fun _ -> stop := true));
@@ -301,7 +375,9 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
     match replicaof with
     | None -> None
     | Some (host, master_port) ->
-        Some (connect_to_master ~host ~port:master_port ~listening_port:port)
+        Some
+          (connect_to_master ~host ~port:master_port ~listening_port:port
+             ~masterauth)
   in
   let clients : (Unix.file_descr, client) Hashtbl.t = Hashtbl.create 16 in
   let channel_subscribers : (string, client list) Hashtbl.t =
@@ -465,67 +541,74 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
     | Some arguments -> Some (propagate_raw (Resp.encode_command arguments))
     | None -> None
   in
-  let rec wake_list_waiters_for_key key =
-    match Hashtbl.find_opt list_waiters key with
-    | None -> ()
-    | Some queue when Queue.is_empty queue -> ()
-    | Some queue -> (
-        let rec next_active_waiter () =
-          if Queue.is_empty queue then None
-          else
-            let client = Queue.pop queue in
-            match client.blocked with
-            | Some (Blocked_list_pop blocked)
-              when blocked.key = key && not client.closed ->
-                Some client
-            | _ -> next_active_waiter ()
-        in
-        match next_active_waiter () with
-        | None -> ()
-        | Some client -> (
-            match
-              Engine.wake_blpop ~now_ms:(current_time_ms clock) engine key
-            with
-            | None -> enqueue_waiter list_waiters key client
-            | Some (key, value) ->
-                client.blocked <- None;
-                send_reply client
-                  (Resp.Array
-                     [
-                       Resp.Bulk_string (Some key);
-                       Resp.Bulk_string (Some value);
-                     ]);
-                wake_list_waiters_for_key key))
+  let resume_client = ref (fun (_ : client) -> ()) in
+  let wake_list_waiters_for_key key =
+    let woken = ref [] in
+    let rec serve () =
+      match Hashtbl.find_opt list_waiters key with
+      | None -> ()
+      | Some queue when Queue.is_empty queue -> Hashtbl.remove list_waiters key
+      | Some queue -> (
+          let rec next_active_waiter () =
+            if Queue.is_empty queue then None
+            else
+              let client = Queue.pop queue in
+              match client.blocked with
+              | Some (Blocked_list_pop blocked)
+                when blocked.key = key && not client.closed ->
+                  Some client
+              | _ -> next_active_waiter ()
+          in
+          match next_active_waiter () with
+          | None -> Hashtbl.remove list_waiters key
+          | Some client -> (
+              match
+                Engine.wake_blpop ~now_ms:(current_time_ms clock) engine key
+              with
+              | None -> enqueue_waiter list_waiters key client
+              | Some (key, value) ->
+                  if upstream = None then
+                    client.last_write_offset <-
+                      propagate_raw (Resp.encode_command [ "LPOP"; key ]);
+                  client.blocked <- None;
+                  send_reply client
+                    (Resp.Array
+                       [
+                         Resp.Bulk_string (Some key);
+                         Resp.Bulk_string (Some value);
+                       ]);
+                  woken := client :: !woken;
+                  serve ()))
+    in
+    serve ();
+    List.iter (fun client -> !resume_client client) (List.rev !woken)
   in
-  let rec wake_stream_waiters_for_key key =
+  let wake_stream_waiters_for_key key =
     match Hashtbl.find_opt stream_waiters key with
     | None -> ()
-    | Some queue when Queue.is_empty queue -> ()
-    | Some queue -> (
-        let rec next_active_waiter () =
-          if Queue.is_empty queue then None
-          else
+    | Some queue ->
+        let attempts = Queue.length queue in
+        let woken = ref [] in
+        for _ = 1 to attempts do
+          if not (Queue.is_empty queue) then
             let client = Queue.pop queue in
-            match client.blocked with
-            | Some (Blocked_stream_read blocked)
-              when List.mem key blocked.keys && not client.closed ->
-                Some client
-            | _ -> next_active_waiter ()
-        in
-        match next_active_waiter () with
-        | None -> ()
-        | Some client -> (
-            match client.blocked with
-            | Some (Blocked_stream_read blocked) -> (
-                match
-                  Engine.wake_xread ~now_ms:(current_time_ms clock) engine
-                    ~queries:blocked.queries
-                with
-                | Some reply ->
-                    client.blocked <- None;
-                    send_reply client reply
-                | None -> enqueue_waiter stream_waiters key client)
-            | _ -> ()))
+            if not client.closed then
+              match client.blocked with
+              | Some (Blocked_stream_read blocked)
+                when List.mem key blocked.keys -> (
+                  match
+                    Engine.wake_xread ~now_ms:(current_time_ms clock) engine
+                      ~queries:blocked.queries
+                  with
+                  | Some reply ->
+                      client.blocked <- None;
+                      send_reply client reply;
+                      woken := client :: !woken
+                  | None -> Queue.push client queue)
+              | _ -> ()
+        done;
+        if Queue.is_empty queue then Hashtbl.remove stream_waiters key;
+        List.iter (fun client -> !resume_client client) (List.rev !woken)
   in
   let wake_waiters_for_keys keys =
     let keys = List.sort_uniq String.compare keys in
@@ -534,6 +617,7 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
   in
   let process_timeouts () =
     let now_ms = current_time_ms clock in
+    let expired = ref [] in
     Hashtbl.iter
       (fun _ client ->
         match client.blocked with
@@ -541,7 +625,8 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
         | Some (Blocked_stream_read { deadline_ms = Some deadline_ms; _ })
           when Int64.compare now_ms deadline_ms >= 0 ->
             client.blocked <- None;
-            send_reply client Resp.Null_array
+            send_reply client Resp.Null_array;
+            expired := client :: !expired
         | Some
             (Blocked_wait
                { required_replicas = _; offset; deadline_ms = Some deadline_ms })
@@ -554,9 +639,11 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
               |> Seq.length
             in
             client.blocked <- None;
-            send_reply client (Resp.Integer (Int64.of_int count))
+            send_reply client (Resp.Integer (Int64.of_int count));
+            expired := client :: !expired
         | _ -> ())
-      clients
+      clients;
+    List.iter (fun client -> !resume_client client) (List.rev !expired)
   in
   let count_replicas_at_offset offset =
     Hashtbl.to_seq_values clients
@@ -566,33 +653,56 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
     |> Seq.length
   in
   let wake_wait_clients () =
+    let woken = ref [] in
     Hashtbl.iter
       (fun _ client ->
         match client.blocked with
         | Some (Blocked_wait { required_replicas; offset; _ }) ->
             let count = count_replicas_at_offset offset in
-            if count >= Int64.to_int required_replicas then (
+            if Int64.compare (Int64.of_int count) required_replicas >= 0 then (
               client.blocked <- None;
-              send_reply client (Resp.Integer (Int64.of_int count)))
+              send_reply client (Resp.Integer (Int64.of_int count));
+              woken := client :: !woken)
         | _ -> ())
-      clients
+      clients;
+    List.iter (fun client -> !resume_client client) (List.rev !woken)
   in
-  let apply_engine_command command =
-    let outcome =
-      Engine.handle ~now_ms:(current_time_ms clock) engine command
-    in
-    wake_waiters_for_keys outcome.wake_keys;
-    outcome
+  let apply_engine_command ~now_ms command =
+    Engine.handle ~now_ms engine command
+  in
+  let propagation_command ~now_ms command (outcome : Engine.outcome) =
+    match (command, outcome.Engine.reply) with
+    | Command.Blpop { key; _ }, Some _ -> Some (Command.Lpop key)
+    | Command.Blpop _, None -> None
+    | Command.Xadd { key; fields; _ }, Some (Resp.Bulk_string (Some id)) ->
+        Some (Command.Xadd { key; id_spec = id; fields })
+    | ( Command.Set
+          { key; value; expiry = Some (Command.Relative_ms relative_ms) },
+        _ ) ->
+        Some
+          (Command.Set
+             {
+               key;
+               value;
+               expiry =
+                 Some
+                   (Command.Absolute_ms
+                      (Expiry.add_saturating now_ms relative_ms));
+             })
+    | _ -> if Command.is_write command then Some command else None
   in
   let handle_immediate_command ~source client command =
     match command with
     | Command.Wait { numreplicas; timeout_ms } ->
         let count = count_replicas_at_offset client.last_write_offset in
-        if count >= Int64.to_int numreplicas || source = Master_stream then
-          send_reply client (Resp.Integer (Int64.of_int count))
+        if
+          Int64.compare (Int64.of_int count) numreplicas >= 0
+          || source = Master_stream
+        then send_reply client (Resp.Integer (Int64.of_int count))
         else
+          let now_ms = current_time_ms clock in
           let deadline_ms =
-            Option.map (Int64.add (current_time_ms clock)) timeout_ms
+            Option.map (Expiry.add_saturating now_ms) timeout_ms
           in
           client.blocked <-
             Some
@@ -602,20 +712,28 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
                    offset = client.last_write_offset;
                    deadline_ms;
                  })
-    | _ -> (
-        let outcome = apply_engine_command command in
+    | _ ->
+        let now_ms = current_time_ms clock in
+        let outcome = apply_engine_command ~now_ms command in
+        (if source = External_client && upstream = None then
+           match propagation_command ~now_ms command outcome with
+           | Some propagated -> (
+               match propagate_command propagated with
+               | Some offset -> client.last_write_offset <- offset
+               | None -> ())
+           | None -> ());
         Option.iter (send_reply client) outcome.reply;
         Option.iter
           (function
             | Engine.List_pop { key; timeout_ms } ->
                 let deadline_ms =
-                  Option.map (Int64.add (current_time_ms clock)) timeout_ms
+                  Option.map (Expiry.add_saturating now_ms) timeout_ms
                 in
                 client.blocked <- Some (Blocked_list_pop { key; deadline_ms });
                 enqueue_waiter list_waiters key client
             | Engine.Stream_read { queries; timeout_ms } ->
                 let deadline_ms =
-                  Option.map (Int64.add (current_time_ms clock)) timeout_ms
+                  Option.map (Expiry.add_saturating now_ms) timeout_ms
                 in
                 let keys = List.map fst queries in
                 client.blocked <-
@@ -624,15 +742,8 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
                   (fun key -> enqueue_waiter stream_waiters key client)
                   keys)
           outcome.block;
-        if
-          source = External_client && upstream = None
-          && Command.is_write command
-        then
-          match propagate_command command with
-          | Some offset -> client.last_write_offset <- offset
-          | None ->
-              ();
-              wake_wait_clients ())
+        wake_waiters_for_keys outcome.wake_keys;
+        if source = External_client && upstream = None then wake_wait_clients ()
   in
   let watched_keys_dirty client =
     Hashtbl.to_seq client.watched
@@ -660,28 +771,57 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
       let commands = List.rev tx.queue_rev in
       clear_transaction client;
       clear_watches client;
-      let replies_rev =
-        List.fold_left
-          (fun replies_rev command ->
-            let outcome = apply_engine_command command in
-            let reply =
-              match outcome.reply with
-              | Some reply -> reply
-              | None ->
-                  Resp.Error "blocking commands are not supported inside MULTI"
-            in
-            reply :: replies_rev)
-          [] commands
+      let now_ms = current_time_ms clock in
+      let execute_queued command : Engine.outcome =
+        match command with
+        | Command.Publish { channel; message } ->
+            {
+              reply =
+                Some
+                  (Resp.Integer (Int64.of_int (publish_message channel message)));
+              block = None;
+              wake_keys = [];
+            }
+        | Command.Info None ->
+            { reply = Some (info_replication ()); block = None; wake_keys = [] }
+        | Command.Info (Some section)
+          when String.lowercase_ascii section = "replication" ->
+            { reply = Some (info_replication ()); block = None; wake_keys = [] }
+        | Command.Info _ ->
+            {
+              reply = Some (Resp.Bulk_string (Some ""));
+              block = None;
+              wake_keys = [];
+            }
+        | _ -> apply_engine_command ~now_ms command
       in
-      send_reply client (Resp.Array (List.rev replies_rev));
+      let outcomes =
+        List.map (fun command -> (command, execute_queued command)) commands
+      in
+      let replies =
+        List.map
+          (fun (_, (outcome : Engine.outcome)) ->
+            match outcome.reply with
+            | Some reply -> reply
+            | None ->
+                Resp.Error "blocking commands are not supported inside MULTI")
+          outcomes
+      in
+      send_reply client (Resp.Array replies);
       if source = External_client && upstream = None then
         List.iter
-          (fun command ->
-            if Command.is_write command then
-              match propagate_command command with
-              | Some offset -> client.last_write_offset <- offset
-              | None -> ())
-          commands;
+          (fun (command, outcome) ->
+            match propagation_command ~now_ms command outcome with
+            | Some propagated -> (
+                match propagate_command propagated with
+                | Some offset -> client.last_write_offset <- offset
+                | None -> ())
+            | None -> ())
+          outcomes;
+      List.iter
+        (fun (_, (outcome : Engine.outcome)) ->
+          wake_waiters_for_keys outcome.wake_keys)
+        outcomes;
       wake_wait_clients ()
   in
   let readonly_message = "You can't write against a read only replica." in
@@ -691,7 +831,7 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
       | Master_stream -> false
       | External_client ->
           upstream <> None
-          && (command_is_write command || command = Multi || command = Exec
+          && (Command.is_write command || command = Multi || command = Exec
             || command = Discard)
     in
     if auth_rejected ~source ~requirepass client command then
@@ -710,30 +850,38 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
         (Resp.Prefixed_error { prefix = "READONLY"; message = readonly_message })
     else
       match (client.tx, command) with
-      | _, Command.Auth password ->
+      | None, Command.Auth password ->
           handle_auth_command ~requirepass client password
-      | _, (Command.AclWhoami | Command.AclGetuser _) ->
+      | None, (Command.AclWhoami | Command.AclGetuser _) ->
           handle_acl_command ~requirepass client command
-      | _, Info None | _, Info (Some "replication") ->
+      | None, Info None -> send_reply client (info_replication ())
+      | None, Info (Some section)
+        when String.lowercase_ascii section = "replication" ->
           send_reply client (info_replication ())
-      | _, Info _ -> send_reply client (Resp.Bulk_string (Some ""))
-      | _, Replconf [ "ACK"; offset ] when client.replica_peer ->
-          (match Int64.of_string_opt offset with
-          | Some offset -> client.replica_ack_offset <- offset
-          | None -> ());
-          wake_wait_clients ()
-      | _, Replconf [ "GETACK"; "*" ] when source = Master_stream -> (
-          match upstream with
-          | Some upstream ->
-              write_all upstream.fd
-                (Resp.encode_command
-                   [ "REPLCONF"; "ACK"; Int64.to_string upstream.offset ])
-          | None -> ())
-      | _, Replconf _ -> send_reply client (Resp.Simple_string "OK")
-      | _, Psync _ when upstream <> None ->
+      | None, Info _ -> send_reply client (Resp.Bulk_string (Some ""))
+      | None, Replconf (kind :: rest) -> (
+          match String.uppercase_ascii kind with
+          | "ACK" when client.replica_peer ->
+              (match rest with
+              | offset_value :: _ -> (
+                  match Integer.of_string_opt offset_value with
+                  | Some offset -> client.replica_ack_offset <- offset
+                  | None -> ())
+              | [] -> ());
+              wake_wait_clients ()
+          | "ACK" -> send_reply client (Resp.Simple_string "OK")
+          | "GETACK" when source = Master_stream -> (
+              match upstream with
+              | Some upstream ->
+                  write_all upstream.fd
+                    (Resp.encode_command
+                       [ "REPLCONF"; "ACK"; Int64.to_string upstream.offset ])
+              | None -> ())
+          | _ -> send_reply client (Resp.Simple_string "OK"))
+      | None, Psync _ when upstream <> None ->
           send_reply client
             (Resp.Error "PSYNC is not supported from replica role")
-      | _, Psync _ ->
+      | None, Psync _ ->
           send_raw client
             (Printf.sprintf "+FULLRESYNC %s %Ld\r\n$0\r\n\r\n" master_replid
                !master_offset);
@@ -806,19 +954,45 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
         if (not client.closed) && Option.is_none client.blocked then
           process_buffer client
   in
+  let () =
+    resume_client :=
+      fun client ->
+        if (not client.closed) && Option.is_none client.blocked then
+          process_buffer client
+  in
+  let ack_upstream () =
+    match upstream with
+    | None -> ()
+    | Some upstream -> (
+        try
+          write_all upstream.fd
+            (Resp.encode_command
+               [ "REPLCONF"; "ACK"; Int64.to_string upstream.offset ])
+        with Unix.Unix_error _ -> upstream.link_status <- "down")
+  in
   let replica_apply arguments =
     match Command.parse arguments with
     | Ok command ->
+        (match command with
+        | Command.Replconf (kind :: _)
+          when String.uppercase_ascii kind = "GETACK" ->
+            ack_upstream ()
+        | _ -> ());
         if Command.is_write command then (
-          let outcome = apply_engine_command command in
-          ignore outcome;
-          Option.iter
-            (fun upstream ->
-              write_all upstream.fd
-                (Resp.encode_command
-                   [ "REPLCONF"; "ACK"; Int64.to_string upstream.offset ]))
-            upstream)
-    | Error _ -> ()
+          let now_ms = current_time_ms clock in
+          let outcome = apply_engine_command ~now_ms command in
+          (match outcome.reply with
+          | Some (Resp.Error _ | Prefixed_error _) ->
+              prerr_endline
+                "ocaml-redis: warning: replicated write failed; replica state \
+                 may diverge"
+          | Some _ | None -> ());
+          wake_waiters_for_keys outcome.wake_keys;
+          ack_upstream ())
+    | Error _ -> (
+        match upstream with
+        | Some upstream -> upstream.link_status <- "down"
+        | None -> ())
   in
   let process_upstream_buffer (upstream : replica_upstream) =
     let rec loop () =
@@ -840,35 +1014,44 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
     loop ()
   in
   let accept_client () =
-    let client_fd, _ = Unix.accept server_fd in
-    let client =
-      {
-        fd = client_fd;
-        buffer = "";
-        blocked = None;
-        tx = None;
-        authenticated = Option.is_none requirepass;
-        watched = Hashtbl.create 8;
-        subscriptions = Hashtbl.create 8;
-        subscription_order_rev = [];
-        replica_peer = false;
-        replica_ack_offset = 0L;
-        last_write_offset = 0L;
-        closed = false;
-      }
-    in
-    Hashtbl.replace clients client_fd client
+    match Unix.accept server_fd with
+    | client_fd, _ ->
+        let client =
+          {
+            fd = client_fd;
+            buffer = "";
+            blocked = None;
+            tx = None;
+            authenticated = Option.is_none requirepass;
+            watched = Hashtbl.create 8;
+            subscriptions = Hashtbl.create 8;
+            subscription_order_rev = [];
+            replica_peer = false;
+            replica_ack_offset = 0L;
+            last_write_offset = 0L;
+            closed = false;
+          }
+        in
+        Hashtbl.replace clients client_fd client
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> ()
+    | exception Unix.Unix_error _ -> ()
   in
   let handle_client (client : client) =
-    let chunk = Bytes.create 4096 in
-    match Unix.read client.fd chunk 0 (Bytes.length chunk) with
-    | 0 -> close_client client
-    | read ->
-        let data = Bytes.sub_string chunk 0 read in
-        client.buffer <- client.buffer ^ data;
-        process_buffer client
-    | exception Unix.Unix_error ((Unix.EPIPE | Unix.ECONNRESET), _, _) ->
-        close_client client
+    if client.closed then ()
+    else
+      let chunk = Bytes.create 4096 in
+      match Unix.read client.fd chunk 0 (Bytes.length chunk) with
+      | 0 -> close_client client
+      | read ->
+          let data = Bytes.sub_string chunk 0 read in
+          client.buffer <- client.buffer ^ data;
+          if String.length client.buffer > max_client_buffer then (
+            send_reply client
+              (Resp.Error "protocol error: request buffer limit exceeded");
+            close_client client)
+          else process_buffer client
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> ()
+      | exception Unix.Unix_error _ -> close_client client
   in
   let handle_upstream upstream =
     let chunk = Bytes.create 4096 in
@@ -876,9 +1059,11 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
     | 0 -> upstream.link_status <- "down"
     | read ->
         upstream.buffer <- upstream.buffer ^ Bytes.sub_string chunk 0 read;
-        process_upstream_buffer upstream
-    | exception Unix.Unix_error ((Unix.EPIPE | Unix.ECONNRESET), _, _) ->
-        upstream.link_status <- "down"
+        if String.length upstream.buffer > max_client_buffer then
+          upstream.link_status <- "down"
+        else process_upstream_buffer upstream
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> ()
+    | exception Unix.Unix_error _ -> upstream.link_status <- "down"
   in
   let rec loop () =
     Hashtbl.filter_map_inplace
@@ -889,7 +1074,8 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
       let client_fds =
         Hashtbl.to_seq_values clients
         |> List.of_seq
-        |> List.filter (fun (client : client) -> Option.is_none client.blocked)
+        |> List.filter (fun (client : client) ->
+            (not client.closed) && Option.is_none client.blocked)
         |> List.map (fun (client : client) -> client.fd)
       in
       let upstream_fd =
@@ -912,8 +1098,8 @@ let run ~port ~replicaof ~rdb_file ~requirepass =
             | Some upstream when fd = upstream.fd -> handle_upstream upstream
             | _ -> (
                 match Hashtbl.find_opt clients fd with
-                | Some client -> handle_client client
-                | None -> ()))
+                | Some client when not client.closed -> handle_client client
+                | Some _ | None -> ()))
         ready;
       loop ())
   in

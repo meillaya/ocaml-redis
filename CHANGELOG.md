@@ -4,6 +4,60 @@ All notable changes to this project will be documented in this file.
 
 The format is inspired by Keep a Changelog, adapted for this learning-project repository.
 
+## [Unreleased]
+
+### Security
+- Require authentication for `PSYNC` and `REPLCONF` when `requirepass` is
+  configured; the previous pre-auth allowlist let any client request a
+  replication stream from an auth-enabled master.
+- Add `--masterauth` so replicas can authenticate instead of relying on the
+  unauthenticated replication exception.
+- Report `ACL GETUSER` password digests as SHA-256, never cleartext, and compare
+  passwords in constant time over fixed-width digests.
+- Flatten CR/LF and cap diagnostics in error replies so a hostile argument
+  cannot inject protocol frames or amplify a request into a huge reply.
+- Ignore `SIGPIPE` and close fds on write failures; a disconnected client can no
+  longer terminate the server or leak its descriptor.
+
+### Fixed
+- Reject RESP bulk lengths that overflow `int`, exceed 64 MiB, or are negative
+  values other than `-1`; cap requests at 1,048,576 arguments and 128 MiB of
+  buffered input per client.
+- Propagate a blocked `BLPOP` as the `LPOP` it performed, including the wakeup
+  path, so replicas converge.
+- Propagate the master-generated `XADD` ID instead of the `*` template.
+- Rewrite relative `SET ... PX` expiries as absolute `PXAT` deadlines before
+  replication.
+- Wake every blocked `XREAD` waiter on a new entry instead of only the first.
+- Resume commands pipelined behind a blocking command after the block clears.
+- Reject `INCR` overflow and accept only canonical decimal integers on the wire.
+- Keep `WAIT` replica counts in `int64` rather than narrowing them to `int`.
+- Accept case-insensitive subcommands and keywords for ACL, REPLCONF,
+  GEOSEARCH/GEODIST, XREAD, and INFO.
+- Validate `GEOSEARCH` center coordinates and reject negative radii.
+- Execute `PUBLISH` and `INFO` inside `MULTI`; reject stateful commands at queue
+  time.
+- Make `XADD` append O(1) instead of O(n) per entry.
+- Cap RDB files at 256 MiB and warn when a non-empty full-resync payload is
+  discarded.
+- Validate `--port`, resolve replica hostnames, support bracketed IPv6, and
+  print clean startup errors instead of backtraces.
+
+### Added
+- `SET ... EXAT|PXAT`, `LPOP`, and the `--masterauth` option.
+- `lib/integer.ml` for strict decimal parsing and `lib/sha256.ml` for ACL
+  digests.
+- `docs/AUDIT.md`, including a residual-risk register.
+- An Excalidraw architecture figure with a reproducible generator.
+- `devenv.nix`, `devenv.yaml`, and `devenv.lock` for a pinned development shell.
+- A CI formatting check and a pinned `ocamlformat` version.
+
+### Documentation
+- Updated the README for the hardened auth model, replication guarantees,
+  security posture, devenv workflow, and architecture figure.
+- Reworked the compatibility matrix around the current subset and its explicit
+  protocol/resource limits.
+
 ## [0.1.0] - 2026-04-15
 
 ### Added

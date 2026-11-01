@@ -54,12 +54,17 @@ jobs:
       - name: Install build tooling
         run: |
           eval "$(opam env --switch=. --set-switch)"
-          opam install dune ocamlformat --yes
+          opam install dune ocamlformat.0.29.0 --yes
 
       - name: Build
         run: |
           eval "$(opam env --switch=. --set-switch)"
           dune build
+
+      - name: Check formatting
+        run: |
+          eval "$(opam env --switch=. --set-switch)"
+          dune build @fmt --display=short
 
       - name: Run deterministic test suite
         run: |
