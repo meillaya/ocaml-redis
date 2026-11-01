@@ -1337,10 +1337,10 @@ let run ~port ~replicaof ~rdb_file ~requirepass ~masterauth ~max_clients
   let accept_client () =
     match Unix.accept server_fd with
     | client_fd, _ ->
+        Unix.set_nonblock client_fd;
         if Hashtbl.length clients >= max_clients then
           reject_over_capacity client_fd
-        else (
-          Unix.set_nonblock client_fd;
+        else
           let client =
             {
               fd = client_fd;
@@ -1367,7 +1367,7 @@ let run ~port ~replicaof ~rdb_file ~requirepass ~masterauth ~max_clients
               closed = false;
             }
           in
-          Hashtbl.replace clients client_fd client)
+          Hashtbl.replace clients client_fd client
     | exception Unix.Unix_error (Unix.EINTR, _, _) -> ()
     | exception Unix.Unix_error _ -> ()
   in
