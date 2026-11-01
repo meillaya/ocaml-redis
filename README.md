@@ -1,12 +1,11 @@
 # ocaml-redis
 
-A Redis-compatible server in OCaml. It speaks the Redis serialization protocol
+A pedagogical, correctness-first Redis-compatible server in OCaml. It speaks the Redis serialization protocol
 (RESP2) and keeps strings, lists, streams, sorted sets, geospatial values,
 transactions, Pub/Sub, replication, and a small loader for Redis RDB files in
 memory.
 
-It is a learning server for people reading a Redis implementation to see how
-the protocol, store, and event loop fit together.
+It illustrates a Redis implementation to see how the protocol, store, and event loop fit together.
 
 ## Run
 
@@ -58,14 +57,6 @@ links are plaintext.
 
 The compatibility matrix lists which commands match Redis. Known gaps and
 operational limits are in the audit.
-
-## Documentation
-
-- [Compatibility matrix](docs/compatibility-matrix.md)
-- [Audit](docs/AUDIT.md)
-- [Architecture](docs/figures/architecture.png)
-- [Changelog](CHANGELOG.md)
-- [Archived README](docs/historical.md)
 
 ## Development shell
 
