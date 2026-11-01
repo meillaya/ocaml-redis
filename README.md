@@ -7,6 +7,21 @@ memory.
 
 It illustrates a Redis implementation to see how the protocol, store, and event loop fit together.
 
+## Architecture
+
+![ocaml-redis request and replication path](docs/figures/architecture.png)
+
+The server is one process with one `Unix.select` loop. Bytes from TCP clients
+pass through RESP framing and the command parser into that loop, which owns
+client sessions, authentication, `MULTI`/`WATCH`, blocked queues, and
+replication. Command outcomes run against a single authoritative store, and
+expiry uses lazy deadlines instead of a background thread.
+
+The figure is reproducible from
+[`docs/figures/architecture.excalidraw`](docs/figures/architecture.excalidraw)
+with
+[`docs/figures/generate_architecture.py`](docs/figures/generate_architecture.py).
+
 ## Run
 
 You need OCaml 5 and dune 3.22 or newer. Install the build tool and TLS
